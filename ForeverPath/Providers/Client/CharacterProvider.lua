@@ -1,0 +1,461 @@
+-- Account-wide character snapshots.
+--
+-- Every character writes a snapshot of itself into the account database
+-- (ForeverPathDB.characters[key]): identity, level, gold, professions, the
+-- recipes it has learned, its bag and bank contents and its open goals. Other
+-- characters read those snapshots to answer "which alt already has this" and
+-- "which alt can craft this". Snapshots are refreshed on login, on logout and
+-- (debounced) whenever bags, goals or recipes change.
+--
+-- Only characters on this character's realm (or a realm the client says is
+-- connected to it) are alts: nothing can be traded or mailed across realms,
+-- and Forever's realms differ in ruleset (PvE / PvP). Every query below
+-- works on those; other realms are listed only on request, for display.
+local _, ns = ...
+
+local Util = ns.Util
+local Events = ns.Events
+local Log = ns.Log
+local Routes = ns.DependencyResolver.Routes
+
+local CharacterProvider = {}
+ns.CharacterProvider = CharacterProvider
+
+CharacterProvider.SNAPSHOT_FRESH = 24 * 3600   -- younger: "snapshot"; older: "cached"
+CharacterProvider.Levels = { LIVE = "live", SNAPSHOT = "snapshot", CACHED = "cached" }
+
+local call = Util.SafeCall
+
+-- Who the logged-in character is. Pure data; the UI adds colours.
+-- The open goals a snapshot records, from the source GoalService installs
+-- at Init (so this provider never reaches up into goals itself):
+-- fn() -> { { id, title, status, itemID } }.
+local goalSource = function() return {} end
+
+function CharacterProvider.SetGoalSource(fn)
+  goalSource = fn
+end
+
+function CharacterProvider.Identity()
+  local info = { name = "Adventurer", realm = "", level = 0, class = "", classFile = nil, race = "", gold = nil }
+  info.name = call(UnitName, "player") or info.name
+  info.level = ns.Compat.PlayerLevel()
+  local classFile, _, className = ns.Compat.PlayerClass()
+  info.class = className or ""
+  info.classFile = classFile
+  info.race = call(UnitRace, "player") or ""
+  info.realm = call(GetRealmName) or ""
+  info.gold = call(GetMoney)
+  return info
+end
+
+-- Gold you can reach: this character live, plus every alt's snapshot.
+-- { current, account, alts = { { name, gold } }, altsTotal }
+function CharacterProvider.AccountGold()
+  local current = call(GetMoney)
+  local out = { current = tonumber(current), alts = {}, altsTotal = 0 }
+  for _, entry in ipairs(CharacterProvider.List()) do
+    local record = entry.record
+    if not entry.isCurrent and type(record) == "table" and type(record.gold) == "number" then
+      out.alts[#out.alts + 1] = { name = record.name, gold = record.gold }
+      out.altsTotal = out.altsTotal + record.gold
+    end
+  end
+  table.sort(out.alts, function(a, b) return a.gold > b.gold end)
+  if out.current then
+    out.account = out.current + out.altsTotal
+  elseif #out.alts > 0 then
+    out.account = out.altsTotal
+  end
+  return out
+end
+
+function CharacterProvider.Key(name, realm)
+  return tostring(name) .. "-" .. tostring(realm or "")
+end
+
+function CharacterProvider.CurrentKey()
+  local id = CharacterProvider.Identity()
+  return CharacterProvider.Key(id.name, id.realm)
+end
+
+function CharacterProvider.Store()
+  if not ns.Database.IsLoaded() then return nil end
+  return ns.db.characters
+end
+
+-- A realm name compared loosely: no spaces, hyphens or apostrophes, lower
+-- case (connected-realm lists spell "Realm 1 PvE" as "Realm1PvE").
+local function realmKey(realm)
+  return (string.gsub(tostring(realm or ""), "[%s%-']", "")):lower()
+end
+
+-- A snapshot's realm (older keys carry it after the name).
+local function realmOf(record)
+  if type(record.realm) == "string" then return record.realm end
+  return string.match(tostring(record.key or ""), "^[^%-]+%-(.*)$") or ""
+end
+
+-- The realms whose characters can trade with this one, as a set of
+-- realmKeys: this realm plus any connected realms.
+function CharacterProvider.TradeRealms()
+  local set = { [realmKey(CharacterProvider.Identity().realm)] = true }
+  local connected = call(_G.GetAutoCompleteRealms)
+  if type(connected) == "table" then
+    for _, realm in ipairs(connected) do set[realmKey(realm)] = true end
+  end
+  return set
+end
+
+-- Realms with snapshots that cannot trade with this one, for display:
+-- { { realm, count } } by name.
+function CharacterProvider.OtherRealms()
+  local store = CharacterProvider.Store()
+  local trade, counts, names = CharacterProvider.TradeRealms(), {}, {}
+  for _, record in pairs(store or {}) do
+    local realm = realmOf(record)
+    local key = realmKey(realm)
+    if not trade[key] then
+      if not counts[key] then names[#names + 1] = key end
+      counts[key] = { realm = realm, count = (counts[key] and counts[key].count or 0) + 1 }
+    end
+  end
+  table.sort(names)
+  local out = {}
+  for i, key in ipairs(names) do out[i] = counts[key] end
+  return out
+end
+
+-- Writes this character's snapshot. Returns the record or nil, reason.
+function CharacterProvider.Snapshot()
+  local store = CharacterProvider.Store()
+  if not store or not ns.chardb then
+    return nil, "not loaded"
+  end
+  local id = CharacterProvider.Identity()
+  local key = CharacterProvider.Key(id.name, id.realm)
+  local inventory = ns.InventoryProvider
+  local bags = { items = {}, scannedAt = nil }
+  if inventory and inventory.ReadBags then
+    local items, scannedAt = inventory.ReadBags()
+    bags.items = Util.DeepCopy(items or {})
+    bags.scannedAt = scannedAt
+  end
+  local bank
+  local cache = ns.chardb.bankCache
+  if cache and cache.scannedAt then
+    bank = { items = Util.DeepCopy(cache.items or {}), scannedAt = cache.scannedAt }
+  end
+  local professions, professionSource = CharacterProvider.CollectProfessions()
+  local previous = store[key]
+  if #professions == 0 and previous and previous.professions and #previous.professions > 0 then
+    -- The client reports no professions right after login; keep what we had.
+    professions = previous.professions
+    professionSource = (previous.professionSource or "earlier") .. " (kept)"
+  end
+  local knownRecipes = {}
+  for recipeID, learned in pairs(ns.chardb.knownRecipes or {}) do
+    if learned == true then knownRecipes[recipeID] = true end
+  end
+  local goals = goalSource()
+  local record = {
+    key = key, name = id.name, realm = id.realm, level = id.level, class = id.class, classFile = id.classFile, race = id.race,
+    gold = id.gold, lastSeen = Util.Now(), bags = bags, bank = bank, professions = professions, professionSource = professionSource,
+    knownRecipes = knownRecipes, goals = goals,
+  }
+  store[key] = record
+  Log.Debug("Snapshot saved for %s (%d bag items, %d professions, %d goals)", key, Util.Count(bags.items), #professions, #goals)
+  Events.Fire("FP_CHARACTERS_UPDATED", key)
+  return record
+end
+
+-- Professions from the live list (GetProfessions) merged with the ones recorded
+-- from profession windows (chardb.professions). Returns list, source text.
+function CharacterProvider.CollectProfessions()
+  local list, byName = {}, {}
+  local live = 0
+  do
+    for _, p in ipairs(ns.ProfessionProvider.GetCharacterProfessions()) do
+      if p.name and not byName[p.name] then
+        local entry = { name = p.name, skillLevel = p.skillLevel, maxSkillLevel = p.maxSkillLevel, skillLine = p.skillLine, icon = p.icon, slot = p.slot }
+        byName[p.name] = entry
+        list[#list + 1] = entry
+        live = live + 1
+      end
+    end
+  end
+  local scanned = 0
+  for professionID, p in pairs(ns.chardb and ns.chardb.professions or {}) do
+    if p.name and not byName[p.name] then
+      local entry = { name = p.name, skillLevel = p.skillLevel, maxSkillLevel = p.maxSkillLevel, skillLine = professionID, scanned = true }
+      byName[p.name] = entry
+      list[#list + 1] = entry
+      scanned = scanned + 1
+    end
+  end
+  -- Primary professions (slots 1-2) first, then the secondaries in client
+  -- order, then anything known only from a recorded window.
+  table.sort(list, function(a, b)
+    local sa, sb = a.slot or 99, b.slot or 99
+    if sa ~= sb then return sa < sb end
+    return (a.name or "") < (b.name or "")
+  end)
+  local source
+  if live > 0 and scanned > 0 then source = "client list + recorded windows"
+  elseif live > 0 then source = "client list"
+  elseif scanned > 0 then source = "recorded windows only (client list empty)"
+  else source = "none (client list empty, no windows recorded)" end
+  return list, source
+end
+
+function CharacterProvider.Get(key)
+  local store = CharacterProvider.Store()
+  return store and store[key] or nil
+end
+
+function CharacterProvider.Remove(key)
+  local store = CharacterProvider.Store()
+  if not store or not store[key] then
+    return false, "no such character"
+  end
+  if key == CharacterProvider.CurrentKey() then
+    return false, "cannot forget the current character"
+  end
+  store[key] = nil
+  Events.Fire("FP_CHARACTERS_UPDATED", key)
+  return true
+end
+
+-- How current a character's snapshot is (a Levels value): "live" for the
+-- current character, "snapshot" under 24 h, "cached" beyond.
+function CharacterProvider.SnapshotLevel(record, now)
+  if record.key == CharacterProvider.CurrentKey() then
+    return CharacterProvider.Levels.LIVE
+  end
+  now = now or Util.Now()
+  local age = now - (record.lastSeen or 0)
+  if age < CharacterProvider.SNAPSHOT_FRESH then
+    return CharacterProvider.Levels.SNAPSHOT
+  end
+  return CharacterProvider.Levels.CACHED
+end
+
+-- This realm's characters (connected realms included), current first, then
+-- most recently seen. opts.realm lists another realm's characters instead,
+-- for display only. Each entry is the stored record plus isCurrent / level /
+-- realm (not persisted).
+function CharacterProvider.List(opts)
+  local store = CharacterProvider.Store()
+  local list = {}
+  if not store then return list end
+  local current = CharacterProvider.CurrentKey()
+  local trade = CharacterProvider.TradeRealms()
+  local wanted = opts and opts.realm and realmKey(opts.realm)
+  for _, record in pairs(store) do
+    local key = realmKey(realmOf(record))
+    if (wanted and key == wanted) or (not wanted and trade[key]) then
+      list[#list + 1] = record
+    end
+  end
+  table.sort(list, function(a, b)
+    if (a.key == current) ~= (b.key == current) then return a.key == current end
+    if (a.lastSeen or 0) ~= (b.lastSeen or 0) then return (a.lastSeen or 0) > (b.lastSeen or 0) end
+    return a.key < b.key
+  end)
+  local out = {}
+  for i, record in ipairs(list) do
+    out[i] = { record = record, key = record.key, isCurrent = record.key == current, level = CharacterProvider.SnapshotLevel(record), realm = realmOf(record) }
+  end
+  return out
+end
+
+function CharacterProvider.Count()
+  return #CharacterProvider.List()
+end
+
+local function recordCount(record, itemID, includeBank)
+  local bags = record.bags and record.bags.items and record.bags.items[itemID] or 0
+  local bank = record.bank and record.bank.items and record.bank.items[itemID] or 0
+  if includeBank == false then bank = 0 end
+  return bags, bank
+end
+
+-- Alts (never the current character) holding itemID.
+-- Returns list { { record, name, bags, bank, total, level } } sorted by total desc.
+function CharacterProvider.Alts(itemID, includeBank)
+  local out = {}
+  for _, entry in ipairs(CharacterProvider.List()) do
+    if not entry.isCurrent then
+      local bags, bank = recordCount(entry.record, itemID, includeBank)
+      if bags + bank > 0 then
+        out[#out + 1] = { record = entry.record, name = entry.record.name, key = entry.key, bags = bags, bank = bank, total = bags + bank, level = entry.level }
+      end
+    end
+  end
+  table.sort(out, function(a, b)
+    if a.total ~= b.total then return a.total > b.total end
+    return a.name < b.name
+  end)
+  return out
+end
+
+-- Units of itemID held by alts, plus the per-alt list.
+function CharacterProvider.AltTotal(itemID, includeBank)
+  local alts = CharacterProvider.Alts(itemID, includeBank)
+  local total = 0
+  for _, alt in ipairs(alts) do total = total + alt.total end
+  return total, alts
+end
+
+-- Characters with a profession, by name (or skill line id): this character
+-- first from the live list, then the snapshotted alts.
+-- Returns { { name, skillLevel, maxSkillLevel, isCurrent } }.
+function CharacterProvider.WithProfession(name, skillLine)
+  local out, seen = {}, {}
+  if not name and not skillLine then return out end
+  local function matches(p)
+    return (name and p.name == name) or (skillLine and skillLine ~= 0 and p.skillLine == skillLine)
+  end
+  local currentName = CharacterProvider.Identity().name
+  do
+    for _, p in ipairs(ns.ProfessionProvider.GetCharacterProfessions() or {}) do
+      if matches(p) and currentName and not seen[currentName] then
+        out[#out + 1] = { name = currentName, skillLevel = p.skillLevel, maxSkillLevel = p.maxSkillLevel, isCurrent = true }
+        seen[currentName] = true
+      end
+    end
+  end
+  for _, entry in ipairs(CharacterProvider.List()) do
+    local record = entry.record
+    if type(record) == "table" and record.name and not seen[record.name] then
+      for _, p in ipairs(record.professions or {}) do
+        if matches(p) then
+          out[#out + 1] = { name = record.name, skillLevel = p.skillLevel, maxSkillLevel = p.maxSkillLevel, isCurrent = entry.isCurrent }
+          seen[record.name] = true
+          break
+        end
+      end
+    end
+  end
+  return out
+end
+
+-- Names of the alts whose snapshot says they know a recipe spell.
+function CharacterProvider.WhoKnows(spellID)
+  local out = {}
+  for _, entry in ipairs(CharacterProvider.List()) do
+    local record = entry.record
+    if not entry.isCurrent and type(record) == "table" and record.knownRecipes and record.knownRecipes[spellID] then
+      out[#out + 1] = record.name
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+-- Whether a listed character (a CharacterProvider.List entry) knows a
+-- recipe: learnedHere (the live flag) for the current character, the
+-- snapshot for an alt.
+function CharacterProvider.Knows(entry, recipeID, learnedHere)
+  if entry.isCurrent then return learnedHere == true end
+  local known = entry.record.knownRecipes
+  return known ~= nil and known[recipeID] == true
+end
+
+-- Alts that have learned a recipe producing itemID.
+-- Returns { { record, name, recipe, professionName, skillLevel } }.
+function CharacterProvider.AltCrafters(itemID)
+  local out = {}
+  if not ns.Database.IsLoaded() then return out end
+  local ids = ns.db.itemRecipes[itemID]
+  if type(ids) ~= "table" then return out end
+  for _, entry in ipairs(CharacterProvider.List()) do
+    if not entry.isCurrent then
+      for recipeID in pairs(ids) do
+        local recipe = ns.db.recipes[recipeID]
+        if recipe and entry.record.knownRecipes and entry.record.knownRecipes[recipeID] then
+          local skill
+          for _, p in ipairs(entry.record.professions or {}) do
+            if p.name == recipe.professionName then skill = p.skillLevel end
+          end
+          out[#out + 1] = { record = entry.record, name = entry.record.name, key = entry.key, recipe = recipe, professionName = recipe.professionName, skillLevel = skill }
+          break
+        end
+      end
+    end
+  end
+  return out
+end
+
+-- Source hints for the dependency resolver: "an alt has it" and "an alt can
+-- craft it". Informational routes; the planner only counts alt stock as owned
+-- when settings.includeAlts is on.
+function CharacterProvider.Sources(itemID)
+  local options = {}
+  local includeBank = ns.Database.Setting("includeBank") ~= false
+  for _, alt in ipairs(CharacterProvider.Alts(itemID, includeBank)) do
+    options[#options + 1] = {
+      kind = Routes.ALT, name = alt.name, count = alt.total,
+      label = "Mail from " .. alt.name,
+      detail = string.format("%s has %d (%s)", alt.name, alt.total, alt.level),
+    }
+  end
+  for _, crafter in ipairs(CharacterProvider.AltCrafters(itemID)) do
+    options[#options + 1] = {
+      kind = Routes.ALTCRAFT, name = crafter.name,
+      label = "Craft on " .. crafter.name,
+      detail = string.format("%s - %s%s", crafter.recipe.name or "recipe", crafter.professionName or "?", crafter.skillLevel and (" " .. crafter.skillLevel) or ""),
+    }
+  end
+  return options
+end
+
+-- For the Characters banner: which alt covers the most of the given needs.
+-- needs: { [itemID] = count }. Returns { name, key, record, covered, items = { { itemID, count } } } or nil.
+function CharacterProvider.BestCoverage(needs)
+  local includeBank = ns.Database.Setting("includeBank") ~= false
+  local best
+  for _, entry in ipairs(CharacterProvider.List()) do
+    if not entry.isCurrent then
+      local covered, items = 0, {}
+      for itemID, count in pairs(needs or {}) do
+        local bags, bank = recordCount(entry.record, itemID, includeBank)
+        local has = math.min(count, bags + bank)
+        if has > 0 then
+          covered = covered + has
+          items[#items + 1] = { itemID = itemID, count = has }
+        end
+      end
+      if covered > 0 and (not best or covered > best.covered) then
+        table.sort(items, function(a, b)
+          if a.count ~= b.count then return a.count > b.count end
+          return a.itemID < b.itemID
+        end)
+        best = { name = entry.record.name, key = entry.key, record = entry.record, covered = covered, items = items }
+      end
+    end
+  end
+  return best
+end
+
+
+local function scheduleSnapshot()
+  Events.Debounce("character-snapshot", 3, CharacterProvider.Snapshot)
+end
+
+function CharacterProvider.Init()
+  Events.On("FP_READY", function()
+    Events.Debounce("character-snapshot", 1, CharacterProvider.Snapshot)
+  end)
+  Events.On("FP_INVENTORY_UPDATED", scheduleSnapshot)
+  Events.On("FP_GOALS_CHANGED", scheduleSnapshot)
+  Events.On("FP_RECIPES_UPDATED", scheduleSnapshot)
+  Events.RegisterWoW("PLAYER_LOGOUT", function()
+    CharacterProvider.Snapshot()
+  end)
+  -- Profession data can arrive after login; both of these catch it.
+  Events.RegisterWoW("SKILL_LINES_CHANGED", scheduleSnapshot)
+  Events.RegisterWoW("PLAYER_ENTERING_WORLD", function()
+    Events.Debounce("character-snapshot-late", 8, CharacterProvider.Snapshot)
+  end)
+end

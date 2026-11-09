@@ -1,0 +1,128 @@
+-- Chat output, debug logging and protected calls with error capture.
+local _, ns = ...
+
+local Log = {}
+ns.Log = Log
+
+Log.debugEnabled = false
+Log.errors = {}
+local MAX_ERRORS = 50
+local unpack = unpack or table.unpack
+
+local function output(text)
+  if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
+    DEFAULT_CHAT_FRAME:AddMessage(text)
+  elseif type(print) == "function" then
+    print(text)
+  end
+end
+Log.Output = output -- tests replace this to capture chat output
+
+function Log.Format(fmt, ...)
+  if select("#", ...) == 0 then
+    return tostring(fmt)
+  end
+  local text = ns.Util.SafeCall(string.format, tostring(fmt), ...)
+  if text then
+    return text
+  end
+  local parts = { tostring(fmt) }
+  for i = 1, select("#", ...) do
+    parts[#parts + 1] = tostring((select(i, ...)))
+  end
+  return table.concat(parts, " ")
+end
+
+function Log.Print(fmt, ...)
+  Log.Output(ns.PREFIX .. ": " .. Log.Format(fmt, ...))
+end
+
+function Log.Debug(fmt, ...)
+  if Log.debugEnabled then
+    Log.Output("|cff888888FP debug|r: " .. Log.Format(fmt, ...))
+  end
+end
+
+-- Turns debug logging on or off; the saved setting follows once loaded.
+function Log.SetDebug(enabled)
+  Log.debugEnabled = enabled and true or false
+  if ns.db and ns.db.settings.debug ~= Log.debugEnabled then
+    ns.Database.SetSetting("debug", Log.debugEnabled)
+  end
+end
+
+-- Records an error and shows its first line. Repeated identical messages are
+-- counted instead of spamming chat; the full text stays in Log.errors (/fp errors).
+local lastMessage, lastTime, repeatCount = nil, 0, 0
+function Log.Error(fmt, ...)
+  local message = Log.Format(fmt, ...)
+  local now = ns.Util.Now()
+  table.insert(Log.errors, { time = now, message = message })
+  while #Log.errors > MAX_ERRORS do
+    table.remove(Log.errors, 1)
+  end
+  local firstLine = message:match("^([^\n]*)") or message
+  if message == lastMessage and now - lastTime < 5 then
+    repeatCount = repeatCount + 1
+    if repeatCount == 1 then
+      Log.Output("|cffff4040ForeverPath error|r: repeated error suppressed, see /fp errors")
+    end
+  else
+    repeatCount = 0
+    Log.Output("|cffff4040ForeverPath error|r: " .. firstLine)
+  end
+  lastMessage, lastTime = message, now
+end
+
+local function traceback(err)
+  local stack = ""
+  if type(debugstack) == "function" then
+    stack = debugstack(2) or ""
+  elseif debug and debug.traceback then
+    stack = debug.traceback("", 2) or ""
+  end
+  return tostring(err) .. "\n" .. stack
+end
+
+-- Runs fn(...) in protected mode for a caller that handles the failure
+-- itself (sets a failed state, reports it): returns true, results... or
+-- false, the error with its stack. Nothing is logged here.
+function Log.Capture(fn, ...)
+  local n = select("#", ...)
+  local args = { ... }
+  return xpcall(function()
+    return fn(unpack(args, 1, n))
+  end, traceback)
+end
+
+-- Runs fn(...) in protected mode. Errors are logged, never swallowed silently.
+function Log.Call(fn, ...)
+  local n = select("#", ...)
+  local args = { ... }
+  local ok, result = xpcall(function()
+    return fn(unpack(args, 1, n))
+  end, traceback)
+  if not ok then
+    Log.Error("%s", result)
+  end
+  return ok, result
+end
+
+local function passOrLog(ok, ...)
+  if ok then return ... end
+  Log.Error("%s", (...))
+  return nil
+end
+
+-- For calls into ForeverPath's own modules where one failing source should
+-- not break the caller: returns every result of fn(...), or nil when fn is
+-- missing or raises. A raise is logged (see /fp errors), unlike
+-- Util.SafeCall, which is for client APIs that are expected to fail.
+function Log.Try(fn, ...)
+  if type(fn) ~= "function" then return nil end
+  local n = select("#", ...)
+  local args = { ... }
+  return passOrLog(xpcall(function()
+    return fn(unpack(args, 1, n))
+  end, traceback))
+end

@@ -1,0 +1,268 @@
+-- Trainer recorder. Each time a profession trainer window opens, every recipe
+-- on offer is written into the account database with the skill it requires,
+-- its cost and the trainer's name and zone. The client's own tables do not
+-- carry trainer requirements (they are server data, sent only while the
+-- window is open), so this is the one place the catalogue's "learned from a
+-- trainer" recipes get an exact required skill. One visit per trainer, by
+-- any character on the account, is enough.
+local _, ns = ...
+
+local Compat = ns.Compat
+local Util = ns.Util
+local Log = ns.Log
+local Events = ns.Events
+
+local TrainerLearner = { open = false, restoreFilters = nil }
+ns.TrainerLearner = TrainerLearner
+
+TrainerLearner.FILTERS = { "available", "unavailable", "used" }
+
+function TrainerLearner.IsAvailable()
+  return Compat.HasTrainerWindow()
+end
+
+-- spellID -> { skill, rank, cost, trainer, zone, subzone, seenAt }
+function TrainerLearner.Store()
+  if not ns.Database.IsLoaded() then return nil end
+  return ns.db.trainers
+end
+
+-- trainer name -> { zone, subzone, recipes, seenAt }
+function TrainerLearner.Trainers()
+  if not ns.Database.IsLoaded() then return nil end
+  return ns.db.trainerNPCs
+end
+
+local function callGlobal(name, ...)
+  return Util.SafeCall(_G[name], ...)
+end
+
+local function currentNPC()
+  local name = ns.Compat.Readable(callGlobal("UnitName", "npc"))
+  if type(name) ~= "string" or name == "" then return nil end
+  return name
+end
+
+local function currentZone()
+  local zone = callGlobal("GetZoneText")
+  local sub = callGlobal("GetSubZoneText")
+  if sub == "" then sub = nil end
+  return zone, sub
+end
+
+local function spellIDFromLink(link)
+  if type(link) ~= "string" then return nil end
+  local id = link:match("|Henchant:(%d+)") or link:match("|Hspell:(%d+)")
+  return id and tonumber(id) or nil
+end
+
+-- The service type ("available", "unavailable", "used", "header") is the
+-- second return on this client (Forever addons read it there); older clients
+-- put it third, so both positions are accepted.
+local KNOWN_TYPES = { available = true, unavailable = true, used = true, header = true }
+local function serviceType(a, b)
+  if KNOWN_TYPES[a] then return a end
+  if KNOWN_TYPES[b] then return b end
+  return nil
+end
+
+-- Reads one trainer line. Returns a record or nil.
+function TrainerLearner.ReadService(index)
+  local name, second, third = callGlobal("GetTrainerServiceInfo", index)
+  if type(name) ~= "string" then return nil end
+  local kind = serviceType(second, third)
+  if kind == "header" then return nil end
+  local record = { name = name, kind = kind }
+  local skill, rank, hasReq = callGlobal("GetTrainerServiceSkillReq", index)
+  if type(skill) == "string" and skill ~= "" and (hasReq ~= false) and tonumber(rank) then
+    record.skill = skill
+    record.rank = tonumber(rank)
+  end
+  -- The spell link names the recipe exactly; without one, the catalogue is
+  -- searched by recipe name within the required profession.
+  local spellID = spellIDFromLink(callGlobal("GetTrainerServiceItemLink", index))
+  if not spellID then
+    spellID = ns.Recipes.SpellIDByName(name, record.skill)
+    record.byName = spellID ~= nil or nil
+  end
+  if not spellID then return nil end
+  record.spellID = spellID
+  local cost = callGlobal("GetTrainerServiceCost", index)
+  if tonumber(cost) then record.cost = tonumber(cost) end
+  return record
+end
+
+-- Shows every line (available, too advanced, already known) so the whole
+-- offer is recorded; the previous filters are put back when the window closes.
+function TrainerLearner.EnsureFilters()
+  if type(_G.GetTrainerServiceTypeFilter) ~= "function" or type(_G.SetTrainerServiceTypeFilter) ~= "function" then
+    return false
+  end
+  local changed = false
+  for _, filter in ipairs(TrainerLearner.FILTERS) do
+    local on = callGlobal("GetTrainerServiceTypeFilter", filter)
+    if not on or on == 0 then
+      TrainerLearner.restoreFilters = TrainerLearner.restoreFilters or {}
+      TrainerLearner.restoreFilters[filter] = true
+      callGlobal("SetTrainerServiceTypeFilter", filter, 1)
+      changed = true
+    end
+  end
+  return changed
+end
+
+function TrainerLearner.RestoreFilters()
+  local restore = TrainerLearner.restoreFilters
+  TrainerLearner.restoreFilters = nil
+  if not restore then return end
+  for filter in pairs(restore) do
+    callGlobal("SetTrainerServiceTypeFilter", filter, 0)
+  end
+end
+
+-- True when the open window belongs to a profession trainer (or the client
+-- cannot say, in which case every recipe with a profession requirement counts).
+local function isProfessionTrainer()
+  local result = Util.SafeCall(_G.IsTradeskillTrainer)
+  if result ~= nil then return result and true or false end
+  return nil
+end
+
+local function isProfessionSkill(name)
+  return ns.Recipes.ProfessionID(name) ~= nil
+end
+
+-- Records the open trainer. Returns the number of recipes recorded.
+function TrainerLearner.ScanTrainer()
+  local store = TrainerLearner.Store()
+  if not store or not TrainerLearner.open or not TrainerLearner.IsAvailable() then return 0 end
+  local npc = currentNPC()
+  if not npc then return 0 end
+  local count = callGlobal("GetNumTrainerServices")
+  if type(count) ~= "number" then return 0 end
+  local tradeskill = isProfessionTrainer()
+  if tradeskill == false then return 0 end
+  local zone, subzone = currentZone()
+  local now = Util.Now()
+  local recorded, changed = 0, false
+  local catalogue = ns.Recipes
+  for index = 1, count do
+    local record = TrainerLearner.ReadService(index)
+    if record and record.rank then
+      local known = catalogue.Get(record.spellID) ~= nil
+      if tradeskill or known or isProfessionSkill(record.skill) then
+        local previous = store[record.spellID]
+        if not previous or previous.rank ~= record.rank or previous.trainer ~= npc or previous.cost ~= record.cost then
+          changed = true
+        end
+        store[record.spellID] = {
+          skill = record.skill, rank = record.rank, cost = record.cost,
+          trainer = npc, zone = zone, subzone = subzone, seenAt = now,
+        }
+        recorded = recorded + 1
+      end
+    end
+  end
+  if recorded > 0 then
+    local trainers = TrainerLearner.Trainers()
+    if trainers then
+      trainers[npc] = { zone = zone, subzone = subzone, recipes = recorded, seenAt = now }
+    end
+    Log.Debug("Recorded trainer %s (%s): %d recipes", npc, zone or "?", recorded)
+    if changed then
+      catalogue.Invalidate()
+      Events.Fire("FP_TRAINERS_UPDATED", npc)
+    end
+  end
+  return recorded
+end
+
+-- Requirement recorded for a recipe spell, else the classic trainer data
+-- (classic = true), or nil.
+local function str(value)
+  return type(value) == "string" and value or nil
+end
+
+-- A trainer record from another player's import, rebuilt field by field so
+-- nothing but the expected strings and numbers gets through.
+local function sharedRecord(entry)
+  return {
+    trainer = str(entry.trainer), zone = str(entry.zone), subzone = str(entry.subzone), skill = str(entry.skill),
+    rank = tonumber(entry.rank), cost = tonumber(entry.cost),
+    mapID = tonumber(entry.mapID), x = tonumber(entry.x), y = tonumber(entry.y),
+    shared = true,
+  }
+end
+
+function TrainerLearner.Requirement(spellID)
+  local store = TrainerLearner.Store()
+  local recorded = store and store[spellID] or nil
+  if recorded then return recorded end
+  -- A trainer another player recorded and shared (App/Share.lua).
+  local shared
+  ns.Database.EachImported("trainers", function(_, trainers)
+    local entry = trainers[spellID]
+    if not shared and type(entry) == "table" then shared = sharedRecord(entry) end
+  end)
+  if shared then return shared end
+  local CDB = ns.ClassicDBBridge
+  if CDB.IsAvailable() then
+    local record = Log.Try(CDB.Trainer, spellID)
+    if record then return record end
+  end
+  return nil
+end
+
+-- "Georgio Bolero (Stormwind City), needs Tailoring 125, 1g"
+function TrainerLearner.Label(spellID)
+  local record = TrainerLearner.Requirement(spellID)
+  if not record then return nil end
+  local where = record.zone or "?"
+  if record.subzone then where = where .. " - " .. record.subzone end
+  local text = string.format("%s (%s), needs %s %d", record.trainer or "trainer", where, record.skill or "skill", record.rank or 0)
+  if record.cost and record.cost > 0 then
+    text = text .. ", " .. Util.Money(record.cost)
+  end
+  if record.classic then text = text .. " (classic data)" end
+  return text
+end
+
+function TrainerLearner.Count()
+  local recipes, trainers = 0, 0
+  recipes = recipes + Util.Count(TrainerLearner.Store())
+  trainers = trainers + Util.Count(TrainerLearner.Trainers())
+  return recipes, trainers
+end
+
+function TrainerLearner.StatusLine()
+  if not TrainerLearner.IsAvailable() then
+    return "Trainer windows: API unavailable on this client; trainer requirements cannot be recorded."
+  end
+  local recipes, trainers = TrainerLearner.Count()
+  if recipes == 0 then
+    return "Trainer requirements: none recorded yet (open a profession trainer once on any character)."
+  end
+  return string.format("Trainer requirements: %d recipe%s from %d trainer%s.", recipes, recipes == 1 and "" or "s", trainers, trainers == 1 and "" or "s")
+end
+
+function TrainerLearner.Init()
+  ns.Recipes.SetTrainerLookup(TrainerLearner.Requirement)
+  -- Shared trainers change the requirements decoded recipes carry.
+  Events.On("FP_SHARED_DATA_CHANGED", ns.Recipes.Invalidate)
+  Events.RegisterWoW("TRAINER_SHOW", function()
+    TrainerLearner.open = true
+    TrainerLearner.EnsureFilters()
+    TrainerLearner.ScanTrainer()
+    -- Lines can fill in a moment after the frame opens.
+    Compat.After(0.5, function() Log.Call(TrainerLearner.ScanTrainer) end)
+  end)
+  Events.RegisterWoW("TRAINER_UPDATE", function()
+    if TrainerLearner.open then
+      Events.Debounce("trainer-scan", 0.3, TrainerLearner.ScanTrainer)
+    end
+  end)
+  Events.RegisterWoW("TRAINER_CLOSED", function()
+    TrainerLearner.open = false
+    TrainerLearner.RestoreFilters()
+  end)
+end

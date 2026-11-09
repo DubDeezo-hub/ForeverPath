@@ -1,0 +1,840 @@
+-- Quests: what the client says about them (log, objectives, completed
+-- flags) plus the quest knowledge other Forever addons ship.
+--
+-- The client cannot enumerate quests it has never seen, so the static index
+-- comes from two read-only bridges:
+--   ForeverDungeonJournal (_G.ForeverDungeonJournal_NS): DB[dungeon].quests
+--     (id, name, level, requires, faction, objective, pickup, turnin,
+--     rewards text, rewardItems = { { itemID, name, quality } }, rewardChoice,
+--     liveXPFallback), QUEST_PREREQ_CHAINS[questID] = { { id, name } } (the
+--     quests required to unlock it, in order), QUEST_START_MAPS[questID] =
+--     { mapID, x, y, label, targetName, detail }.
+--   Attune (Attune_Data): quests[questID] = { requiredLevel, groupSize },
+--     AttuneLang["Q1_<id>"] names, questGivers[questID] = { uiMapID, x, y,
+--     giverName }, questRewards[questID] = { choice = { { itemID, count } },
+--     fixed = { ... } }, and the attunement whose chain uses the quest.
+-- Quests in the player's log are read from C_QuestLog whether or not either
+-- addon knows them; titles of other quests are requested from the client
+-- (RequestLoadQuestByID) and arrive with QUEST_DATA_LOAD_RESULT.
+-- Classic-era quests (CMaNGOS classic-db, Providers/Integrations/ClassicDB.lua)
+-- are the baseline under all of it: Get() falls back to them, and givers,
+-- turn-ins, required items, rewards and prerequisite chains come from them
+-- when nothing Forever-specific knows the quest.
+-- Questlines (the chain of steps that leads to a quest) come from Attune's
+-- attunement and class-quest chains, else the classic prerequisites; quest givers, turn-ins and the items a
+-- quest asks for from Providers/Learners/QuestFactsLearner.lua (shipped catalogue +
+-- what this account has learned at quest windows).
+local _, ns = ...
+
+local Compat = ns.Compat
+local Util = ns.Util
+local QuestStates = ns.Planner.QuestStates
+local StepStates = ns.AttuneBridge.StepStates
+local Log = ns.Log
+local Events = ns.Events
+
+local QuestProvider = { index = nil, titles = {}, requested = {}, logCache = nil }
+ns.QuestProvider = QuestProvider
+
+QuestProvider.ICON = "Interface\\GossipFrame\\AvailableQuestIcon"
+QuestProvider.ICON_READY = "Interface\\GossipFrame\\ActiveQuestIcon"
+QuestProvider.MAX_LOG = 20
+
+local function questLog()
+  return type(C_QuestLog) == "table" and C_QuestLog or nil
+end
+
+local call = Util.SafeCall
+
+function QuestProvider.IsAvailable()
+  return Compat.IsQuestFlaggedCompleted ~= nil and Compat.IsOnQuest ~= nil
+end
+
+-- Both addons are read through their own adapters (ns.DungeonJournalBridge and
+-- ns.AttuneBridge), so each is detected in one place.
+local function journal()
+  return ns.DungeonJournalBridge.Get()
+end
+
+local function rewardsFromJournal(quest)
+  local items = {}
+  for _, reward in ipairs(type(quest.rewardItems) == "table" and quest.rewardItems or {}) do
+    if type(reward) == "table" and tonumber(reward[1]) then
+      items[#items + 1] = { itemID = tonumber(reward[1]), name = reward[2], quality = reward[3], count = 1 }
+    end
+  end
+  return items
+end
+
+local function rewardsFromAttune(record)
+  local items = {}
+  if type(record) ~= "table" then return items, false end
+  for _, entry in ipairs(type(record.fixed) == "table" and record.fixed or {}) do
+    if type(entry) == "table" and tonumber(entry[1]) then items[#items + 1] = { itemID = tonumber(entry[1]), count = tonumber(entry[2]) or 1, fixed = true } end
+  end
+  local choice = false
+  for _, entry in ipairs(type(record.choice) == "table" and record.choice or {}) do
+    if type(entry) == "table" and tonumber(entry[1]) then
+      items[#items + 1] = { itemID = tonumber(entry[1]), count = tonumber(entry[2]) or 1 }
+      choice = true
+    end
+  end
+  return items, choice
+end
+
+-- Builds the static index once: questID -> entry. Entries carry
+--   { id, name, level, requires, faction, instance, location, pickup, turnin, objective,
+--     rewardText, rewardSummary, rewards = { { itemID, name, quality, count } }, rewardChoice,
+--     xp, source ("journal" | "attune" | "chain"), chain = { { id, name } }, start = { mapID, x, y, label },
+--     attunement, groupSize }
+function QuestProvider.Index()
+  if QuestProvider.index then return QuestProvider.index end
+  local index = {}
+  local j = journal()
+  if j then
+    local chains = type(j.QUEST_PREREQ_CHAINS) == "table" and j.QUEST_PREREQ_CHAINS or {}
+    local starts = type(j.QUEST_START_MAPS) == "table" and j.QUEST_START_MAPS or {}
+    local xp = type(j.FOREVER_QUEST_XP_FALLBACK) == "table" and j.FOREVER_QUEST_XP_FALLBACK or {}
+    for dungeonName, dungeon in pairs(j.DB) do
+      for _, quest in ipairs(type(dungeon) == "table" and type(dungeon.quests) == "table" and dungeon.quests or {}) do
+        local id = type(quest) == "table" and tonumber(quest.id) or nil
+        if id and not index[id] then
+          local start = starts[id]
+          index[id] = {
+            id = id, name = quest.name or ("Quest " .. id), level = tonumber(quest.level), requires = tonumber(quest.requires),
+            faction = quest.faction or "Both", instance = tostring(dungeonName), location = dungeon.location,
+            pickup = quest.pickup, turnin = quest.turnin, objective = quest.objective,
+            rewardText = quest.rewards, rewardSummary = quest.rewardSummary, rewards = rewardsFromJournal(quest), rewardChoice = quest.rewardChoice == true,
+            xp = tonumber(quest.liveXPFallback) or xp[id], source = "journal",
+            chain = type(chains[id]) == "table" and chains[id] or nil,
+            start = type(start) == "table" and { mapID = start.mapID, x = start.x, y = start.y, label = start.label, target = start.targetName, detail = start.detail } or nil,
+          }
+        end
+      end
+    end
+    -- Prerequisites that are not dungeon quests themselves still get an entry.
+    for questID, chain in pairs(chains) do
+      local owner = index[tonumber(questID)]
+      for _, link in ipairs(type(chain) == "table" and chain or {}) do
+        local id = type(link) == "table" and tonumber(link.id) or nil
+        if id and not index[id] then
+          local start = starts[id]
+          index[id] = {
+            id = id, name = link.name or ("Quest " .. id), faction = owner and owner.faction or "Both",
+            instance = owner and owner.instance or "Prerequisites", location = owner and owner.location, source = "chain", prereqOf = tonumber(questID),
+            rewards = {}, xp = xp[id],
+            start = type(start) == "table" and { mapID = start.mapID, x = start.x, y = start.y, label = start.label, target = start.targetName, detail = start.detail } or nil,
+          }
+        end
+      end
+    end
+  end
+  for _, record in ipairs(ns.AttuneBridge.QuestRecords()) do
+    local id = record.id
+    local entry = index[id]
+    if not entry then
+      local items, choice = rewardsFromAttune(record.rewards)
+      local giver = record.giver
+      entry = {
+        id = id, name = record.name or ("Quest " .. id), requires = record.requires, groupSize = record.groupSize,
+        faction = record.faction or "Both", instance = record.attunement or "Attunements", location = record.location,
+        pickup = giver and giver.label or nil, rewards = items, rewardChoice = choice, source = "attune", start = giver,
+      }
+      index[id] = entry
+    else
+      entry.groupSize = entry.groupSize or record.groupSize
+      entry.requires = entry.requires or record.requires
+      if not entry.start and record.giver then
+        entry.start = record.giver
+        entry.pickup = entry.pickup or record.giver.label
+      end
+    end
+    if record.attunement then entry.attunement = record.attunement end
+  end
+  QuestProvider.index = index
+  return index
+end
+
+function QuestProvider.Invalidate()
+  QuestProvider.index = nil
+  QuestProvider.logCache = nil
+end
+
+-- The curated entry (journal, Attune), else Questie's, else the classic one.
+function QuestProvider.Get(questID)
+  questID = tonumber(questID) or 0
+  local entry = QuestProvider.Index()[questID]
+  if entry then return entry end
+  return ns.QuestieBridge.Quest(questID) or ns.ClassicDBBridge.Quest(questID)
+end
+
+function QuestProvider.Classic(questID)
+  return ns.ClassicDBBridge.Quest(tonumber(questID) or 0)
+end
+
+-- Can this character take the quest? Curated entries check their faction;
+-- classic entries also their class.
+function QuestProvider.Eligible(entry)
+  if not entry then return false end
+  local faction = QuestProvider.Faction()
+  if entry.classic then return ns.ClassicDBBridge.Eligible(entry, faction) end
+  if entry.questie then return ns.QuestieBridge.Eligible(entry, faction) end
+  return not (entry.faction and entry.faction ~= "Both" and faction and entry.faction ~= faction)
+end
+
+-- The player's faction and level, through the provider so the Planner can
+-- take them from its injected deps.quest.
+function QuestProvider.Faction()
+  return Compat.PlayerFaction()
+end
+
+local function factionMatches(entry, faction)
+  local f = entry.faction
+  return f == nil or f == "Both" or faction == nil or f == faction
+end
+
+-- Every indexed quest for a faction (default: the player's), sorted by instance then level then name.
+function QuestProvider.List(faction)
+  faction = faction or QuestProvider.Faction()
+  local out = {}
+  for _, entry in pairs(QuestProvider.Index()) do
+    if factionMatches(entry, faction) then out[#out + 1] = entry end
+  end
+  table.sort(out, function(a, b)
+    if a.instance ~= b.instance then return tostring(a.instance) < tostring(b.instance) end
+    if (a.level or 0) ~= (b.level or 0) then return (a.level or 0) < (b.level or 0) end
+    if a.name ~= b.name then return tostring(a.name) < tostring(b.name) end
+    return a.id < b.id
+  end)
+  return out
+end
+
+function QuestProvider.PlayerLevel()
+  return Compat.PlayerLevel()
+end
+
+-- "trivial" (grey), "easy" (green), "standard" (yellow), "hard" (orange), "impossible" (red).
+function QuestProvider.Difficulty(questLevel, playerLevel)
+  questLevel, playerLevel = tonumber(questLevel), tonumber(playerLevel) or 0
+  if not questLevel then return "standard" end
+  local diff = questLevel - playerLevel
+  if diff >= 5 then return "impossible" end
+  if diff >= 3 then return "hard" end
+  if diff >= -2 then return "standard" end
+  local grey
+  if playerLevel <= 5 then grey = 0
+  elseif playerLevel <= 39 then grey = playerLevel - 5 - math.floor(playerLevel / 10)
+  elseif playerLevel <= 59 then grey = playerLevel - 1 - math.floor(playerLevel / 5)
+  else grey = playerLevel - 9 end
+  if questLevel > grey then return "easy" end
+  return "trivial"
+end
+
+---------------------------------------------------------------------------
+-- Live state
+---------------------------------------------------------------------------
+local function copyObjectives(list)
+  local out = {}
+  for _, o in ipairs(type(list) == "table" and list or {}) do
+    if type(o) == "table" then
+      out[#out + 1] = { text = o.text, type = o.type, finished = o.finished == true, numFulfilled = tonumber(o.numFulfilled) or 0, numRequired = tonumber(o.numRequired) or 0 }
+    end
+  end
+  return out
+end
+
+-- The quests in the log, in the client's order: { { questID, title, level,
+-- zone, logIndex, ready } }. Zone headers are not entries: each quest carries
+-- the header it sits under as `zone`. Counts are LogCapacity's.
+function QuestProvider.LogEntries()
+  if QuestProvider.logCache then return QuestProvider.logCache end
+  local ql = questLog()
+  local entries, zone = {}, nil
+  local count = ql and call(ql.GetNumQuestLogEntries) or nil
+  if ql and type(ql.GetInfo) == "function" and tonumber(count) then
+    for i = 1, count do
+      local info = call(ql.GetInfo, i)
+      if type(info) == "table" then
+        if info.isHeader then
+          zone = info.title
+        elseif tonumber(info.questID) then
+          entries[#entries + 1] = { questID = tonumber(info.questID), title = info.title, level = tonumber(info.level), zone = zone, logIndex = i,
+            ready = call(ql.IsComplete, info.questID) == true }
+        end
+      end
+    end
+  end
+  QuestProvider.logCache = entries
+  return entries
+end
+
+-- numQuests, maxQuests for the log footer.
+function QuestProvider.LogCapacity()
+  local ql = questLog()
+  local _, numQuests = ql and call(ql.GetNumQuestLogEntries) or nil, nil
+  if ql then
+    local entries, quests = call(ql.GetNumQuestLogEntries)
+    numQuests = tonumber(quests) or #QuestProvider.LogEntries()
+    local max = call(ql.GetMaxNumQuestsCanAccept)
+    return numQuests, tonumber(max) or QuestProvider.MAX_LOG
+  end
+  return 0, QuestProvider.MAX_LOG
+end
+
+-- The chat link of a quest in the log, or nil.
+function QuestProvider.Link(questID)
+  local logIndex = QuestProvider.State(questID).logIndex
+  local link = logIndex and call(_G.GetQuestLink, logIndex) or nil
+  return type(link) == "string" and link or nil
+end
+
+-- Adds a quest in the log to the objective tracker. Returns whether the
+-- client has the call (a quest not in the log is the caller's check).
+function QuestProvider.Watch(questID)
+  local log = questLog()
+  if not log or type(log.AddQuestWatch) ~= "function" then return false end
+  call(log.AddQuestWatch, questID)
+  return true
+end
+
+-- { completed, inLog, ready, logIndex, title, level, objectives = { { text, finished, numFulfilled, numRequired } }, fraction }
+function QuestProvider.State(questID)
+  local state = { completed = false, inLog = false, ready = false, objectives = {}, fraction = 0 }
+  if not QuestProvider.IsAvailable() then return state end
+  state.completed = Util.SafeCall(Compat.IsQuestFlaggedCompleted, questID) == true
+  state.inLog = Util.SafeCall(Compat.IsOnQuest, questID) == true
+  local ql = questLog()
+  if state.inLog and ql then
+    state.ready = call(ql.IsComplete, questID) == true
+    local logIndex = call(ql.GetLogIndexForQuestID, questID)
+    state.logIndex = tonumber(logIndex)
+    if state.logIndex and type(ql.GetInfo) == "function" then
+      local info = call(ql.GetInfo, state.logIndex)
+      if type(info) == "table" then
+        state.title, state.level = info.title, tonumber(info.level)
+      end
+    end
+    state.objectives = copyObjectives(call(ql.GetQuestObjectives, questID))
+    local total, got = 0, 0
+    for _, o in ipairs(state.objectives) do
+      if o.numRequired > 0 then
+        total = total + o.numRequired
+        got = got + math.min(o.numFulfilled, o.numRequired)
+      else
+        total = total + 1
+        got = got + (o.finished and 1 or 0)
+      end
+    end
+    if state.ready then state.fraction = 1
+    elseif total > 0 then state.fraction = got / total end
+  end
+  if state.completed then state.fraction = 1 end
+  return state
+end
+
+-- "3/8 Deviate Hides, Mad Magglish slain"
+function QuestProvider.ObjectiveText(state)
+  local parts = {}
+  for _, o in ipairs(state and state.objectives or {}) do
+    if o.numRequired > 0 then
+      parts[#parts + 1] = string.format("%d/%d %s", o.numFulfilled, o.numRequired, (o.text or ""):gsub("^%d+/%d+%s*", ""))
+    elseif o.text and o.text ~= "" then
+      parts[#parts + 1] = o.text .. (o.finished and " (done)" or "")
+    end
+  end
+  return table.concat(parts, ", ")
+end
+
+-- Name from the index, the log, the title cache, or the client (loaded asynchronously).
+function QuestProvider.Name(questID)
+  local entry = QuestProvider.Get(questID)
+  if entry and entry.name then return entry.name end
+  for _, log in ipairs(QuestProvider.LogEntries()) do
+    if log.questID == questID and log.title then return log.title end
+  end
+  if QuestProvider.titles[questID] then return QuestProvider.titles[questID] end
+  local ql = questLog()
+  if ql then
+    local title = call(ql.GetTitleForQuestID, questID)
+    if type(title) == "string" and title ~= "" then
+      QuestProvider.titles[questID] = title
+      return title
+    end
+    if not QuestProvider.requested[questID] and type(ql.RequestLoadQuestByID) == "function" then
+      QuestProvider.requested[questID] = true
+      Util.SafeCall(ql.RequestLoadQuestByID, questID)
+    end
+  end
+  return "Quest " .. tostring(questID)
+end
+
+-- The quests to do, in order: prerequisites (journal chain) then the quest
+-- itself, each with its live state. `next` is the first one not completed.
+function QuestProvider.Chain(questID)
+  local entry = QuestProvider.Get(questID)
+  local steps = {}
+  for _, link in ipairs(entry and entry.chain or {}) do
+    local id = tonumber(link.id)
+    if id then
+      local state = QuestProvider.State(id)
+      steps[#steps + 1] = { id = id, name = link.name or QuestProvider.Name(id), state = state, entry = QuestProvider.Get(id), prerequisite = true }
+    end
+  end
+  local state = QuestProvider.State(questID)
+  steps[#steps + 1] = { id = questID, name = entry and entry.name or QuestProvider.Name(questID), state = state, entry = entry }
+  local nextStep
+  for _, step in ipairs(steps) do
+    if not step.state.completed and not nextStep then nextStep = step end
+  end
+  return steps, nextStep
+end
+
+-- Quests (indexed) that reward itemID.
+function QuestProvider.QuestsRewarding(itemID)
+  local out, seen = {}, {}
+  for _, entry in pairs(QuestProvider.Index()) do
+    for _, reward in ipairs(entry.rewards or {}) do
+      if reward.itemID == itemID then out[#out + 1] = entry seen[entry.id] = true break end
+    end
+  end
+  table.sort(out, function(a, b) return a.id < b.id end)
+  -- Questie's, then classic quests (this character's faction and class) after the curated ones.
+  for _, entry in ipairs(ns.QuestieBridge.QuestsRewarding(itemID, QuestProvider.Faction())) do
+    if not seen[entry.id] then
+      out[#out + 1] = entry
+      seen[entry.id] = true
+    end
+  end
+  for _, entry in ipairs(ns.ClassicDBBridge.QuestsRewarding(itemID)) do
+    if not seen[entry.id] then out[#out + 1] = entry end
+  end
+  return out
+end
+
+-- Quests by name (index and log), exact and prefix matches first.
+function QuestProvider.Search(text, limit)
+  local needle = Util.SearchNeedle(text)
+  if not needle then return {} end
+  local hits, seen = {}, {}
+  local function consider(id, name, where)
+    if seen[id] or type(name) ~= "string" then return end
+    local rank = Util.MatchRank(name, needle)
+    if rank then
+      seen[id] = true
+      hits[#hits + 1] = { questID = id, name = name, where = where, rank = rank }
+    end
+  end
+  local faction = QuestProvider.Faction()
+  for _, entry in pairs(QuestProvider.Index()) do
+    if factionMatches(entry, faction) then consider(entry.id, entry.name, entry.instance) end
+  end
+  for _, log in ipairs(QuestProvider.LogEntries()) do
+    consider(log.questID, log.title, log.zone or "Quest log")
+  end
+  local CDB = ns.ClassicDBBridge
+  for _, hit in ipairs(CDB.Search(text)) do
+    if not seen[hit.questID] then
+      local entry = CDB.Quest(hit.questID)
+      consider(hit.questID, hit.name, (entry.location or "Classic") .. (entry.level and (" - level " .. entry.level) or ""))
+    end
+  end
+  return Util.SortRankedHits(hits, "questID", limit)
+end
+
+-- Display text and colour kind per Planner.QuestStates key.
+local STATE_TEXT = {
+  done = { "Done", "ok" }, ready = { "Ready", "ok" }, in_log = { "In log", "info" },
+  available = { "Available", "partial" }, locked = { "Locked", "text" },
+}
+
+function QuestProvider.StateText(key)
+  local text = STATE_TEXT[key]
+  return text[1], text[2]
+end
+
+-- Where a quest stands for the player, a Planner.QuestStates key (entry optional).
+function QuestProvider.StateKey(state, entry, playerLevel)
+  if state.completed then return QuestStates.DONE end
+  if state.ready then return QuestStates.READY end
+  if state.inLog then return QuestStates.IN_LOG end
+  playerLevel = playerLevel or QuestProvider.PlayerLevel()
+  if entry and entry.requires and entry.requires > playerLevel then return QuestStates.LOCKED end
+  if entry and entry.chain then
+    for _, link in ipairs(entry.chain) do
+      local id = tonumber(link.id)
+      if id and not QuestProvider.State(id).completed then return QuestStates.LOCKED end
+    end
+  end
+  -- Classic prerequisites: every group needs one completed member.
+  for _, group in ipairs(entry and entry.prerequisites or {}) do
+    local met = false
+    for _, id in ipairs(group) do
+      if QuestProvider.State(id).completed then met = true break end
+    end
+    if not met then return QuestStates.LOCKED end
+  end
+  return QuestStates.AVAILABLE
+end
+
+-- "Done", "Ready", "In log", "Available" or "Locked", its colour kind and the key.
+function QuestProvider.StateLabel(state, entry, playerLevel)
+  local key = QuestProvider.StateKey(state, entry, playerLevel)
+  local text, kind = QuestProvider.StateText(key)
+  return text, kind, key
+end
+
+function QuestProvider.Count()
+  local n = 0
+  n = n + Util.Count(QuestProvider.Index())
+  return n
+end
+
+function QuestProvider.StatusLine()
+  if not QuestProvider.IsAvailable() then
+    return "Quests: the quest API (C_QuestLog) is unavailable on this client."
+  end
+  local sources = {}
+  if ns.DungeonJournalBridge.IsAvailable() then sources[#sources + 1] = "ForeverDungeonJournal" end
+  if ns.AttuneBridge.IsAvailable() then sources[#sources + 1] = "Attune" end
+  if ns.QuestieBridge.IsAvailable() then sources[#sources + 1] = "Questie" end
+  local numQuests, max = QuestProvider.LogCapacity()
+  local QF = ns.QuestFactsLearner
+  local classic = ns.ClassicDBBridge.Counts()
+  return string.format("Quests: %d known from %s%s; quest log %d / %d; givers and items recorded for %d quests.", QuestProvider.Count(),
+    #sources > 0 and table.concat(sources, " and ") or "no data addon", classic > 0 and string.format(", plus %d classic quests", classic) or "",
+    numQuests, max, QF.Count() + QF.ShippedCount())
+end
+
+---------------------------------------------------------------------------
+-- Questlines, givers and required items
+---------------------------------------------------------------------------
+local QUEST_STEP = { Quest = true, ["Pick Up"] = true, ["Turn In"] = true }
+QuestProvider.QUEST_STEP = QUEST_STEP
+
+local function firstQuestID(step)
+  return tonumber(string.match(tostring(step.wowheadID or ""), "^(%d+)"))
+end
+
+-- The quests to do before questID, then questID, in order, over whichever
+-- source knows each quest (Questie, else classic-db; Get decides). An "any
+-- of" prerequisite group takes the member already completed, else the first
+-- this character can take. Returns order, follows.
+QuestProvider.CHAIN_LIMIT = 40
+
+function QuestProvider.ChainTo(questID)
+  local order, seen, follows = {}, {}, {}
+  local depth = 0
+  local function visit(id)
+    if seen[id] or depth > QuestProvider.CHAIN_LIMIT then return end
+    seen[id] = true
+    depth = depth + 1
+    local entry = QuestProvider.Get(id)
+    follows[id] = {}
+    for _, group in ipairs(entry and entry.prerequisites or {}) do
+      local pick
+      for _, member in ipairs(group) do
+        if QuestProvider.State(member).completed then pick = member break end
+      end
+      if not pick then
+        for _, member in ipairs(group) do
+          local e = QuestProvider.Get(member)
+          if e and QuestProvider.Eligible(e) then pick = member break end
+        end
+      end
+      pick = pick or group[1]
+      if pick and QuestProvider.Get(pick) then
+        visit(pick)
+        table.insert(follows[id], pick)
+      end
+    end
+    order[#order + 1] = id
+  end
+  visit(tonumber(questID))
+  return order, follows
+end
+
+-- The chain of database prerequisites (Questie, else classic-db) that leads
+-- to questID, in the same shape as an Attune questline; nil when it has none.
+function QuestProvider.ClassicQuestline(questID)
+  questID = tonumber(questID)
+  local target = questID and QuestProvider.Get(questID)
+  if not (target and (target.classic or target.questie)) then return nil end
+  local order, follows = QuestProvider.ChainTo(questID)
+  if #order < 2 then return nil end
+  local line = { attune = { id = "classic:" .. questID, name = target.name .. " chain", classic = true }, steps = {}, done = 0, total = #order, classic = true }
+  local done = {}
+  for index, id in ipairs(order) do
+    local entry = QuestProvider.Get(id)
+    local state = QuestProvider.State(id)
+    local giver = QuestProvider.Giver(id)
+    local step = {
+      key = "classic-" .. id, id = tostring(id), attuneID = line.attune.id, type = "Quest", typeLabel = "Quest",
+      name = entry and entry.name or QuestProvider.Name(id), location = (giver and giver.zone) or (entry and entry.location) or nil,
+      wowheadID = tostring(id), icon = QuestProvider.ICON, follows = {}, stage = index, count = 1, side = false,
+      questID = id, entry = entry, questState = state, done = state.completed, classic = entry and entry.classic or nil, questie = entry and entry.questie or nil,
+    }
+    for _, f in ipairs(follows[id] or {}) do step.follows[#step.follows + 1] = tostring(f) end
+    done[id] = step.done
+    line.steps[index] = step
+    if step.done then line.done = line.done + 1 end
+  end
+  for _, step in ipairs(line.steps) do
+    if step.done then
+      step.state = StepStates.DONE
+    else
+      local ready = true
+      for _, f in ipairs(follows[step.questID] or {}) do
+        if not done[f] then ready = false end
+      end
+      step.state = ready and StepStates.CURRENT or StepStates.LOCKED
+      if ready and not line.next then line.next = step end
+    end
+  end
+  line.target = line.steps[#line.steps]
+  line.complete = line.target.done
+  line.percent = line.total > 0 and math.floor(line.done * 100 / line.total + 0.5) or 0
+  if line.complete then line.percent = 100 end
+  return line
+end
+
+-- The attunement or class-quest chain (Attune) that leads to questID for
+-- this faction and class, else the database prerequisite chain
+-- (ClassicQuestline), each quest step carrying its entry and live state:
+-- { attune, steps, target, next, done, total, percent, complete }. nil when
+-- no chain includes the quest.
+function QuestProvider.Questline(questID)
+  local AttuneBridge = ns.AttuneBridge
+  local line
+  if AttuneBridge.IsAvailable() then
+    local result = Log.Try(AttuneBridge.QuestlineFor, tonumber(questID))
+    if type(result) == "table" then line = result end
+  end
+  if not line then
+    -- A journal chain is Forever-curated: it wins over the classic one.
+    local entry = QuestProvider.Index()[tonumber(questID) or 0]
+    if entry and entry.chain then return nil end
+    return QuestProvider.ClassicQuestline(questID)
+  end
+  for _, step in ipairs(line.steps) do
+    if QUEST_STEP[step.type] then
+      step.questID = firstQuestID(step)
+      if step.questID then
+        step.entry = QuestProvider.Get(step.questID)
+        step.questState = QuestProvider.State(step.questID)
+      end
+    end
+  end
+  return line
+end
+
+function QuestProvider.Facts(questID)
+  return ns.QuestFactsLearner.Get(questID)
+end
+
+-- Map coordinates arrive as 0-1 fractions (journal, learned) or percent (Attune).
+local function fraction(v)
+  v = tonumber(v)
+  if not v then return nil end
+  if v > 1 then return v / 100 end
+  return v
+end
+
+local function placeOf(p)
+  return { name = p.name, mapID = p.mapID, x = fraction(p.x), y = fraction(p.y), zone = p.zone, subzone = p.subzone,
+    label = p.name .. (p.zone and (" - " .. p.zone) or "") }
+end
+
+-- Where a quest starts: { name, mapID, x, y, zone, label } from learned or
+-- shipped facts, else the journal/Attune start pin, else the pickup text.
+function QuestProvider.Giver(questID)
+  local facts = QuestProvider.Facts(questID)
+  if facts and facts.giver and facts.giver.name then return placeOf(facts.giver) end
+  local entry = QuestProvider.Get(questID)
+  if entry and entry.start then
+    local s = entry.start
+    local name = s.target or (s.label and (s.label:match("^([^%-]+)") or s.label):gsub("%s+$", "")) or entry.pickup
+    return { name = name, mapID = s.mapID, x = fraction(s.x), y = fraction(s.y), zone = entry.location, label = s.label or name }
+  end
+  local classic = ns.QuestieBridge.Giver(questID) or ns.ClassicDBBridge.Giver(questID)
+  if entry and entry.pickup and not entry.classic and not entry.questie then
+    local name = entry.pickup:match("^([^,]+)") or entry.pickup
+    -- The journal names the giver; the classic spawn gives the position when it is the same NPC.
+    if classic and classic.mapID and string.lower(classic.name or "") == string.lower(name) then
+      classic.label = entry.pickup
+      return classic
+    end
+    return { name = name, zone = entry.location, label = entry.pickup }
+  end
+  return classic
+end
+
+function QuestProvider.Turnin(questID)
+  local facts = QuestProvider.Facts(questID)
+  if facts and facts.turnin and facts.turnin.name then return placeOf(facts.turnin) end
+  local entry = QuestProvider.Get(questID)
+  local classic = ns.QuestieBridge.Turnin(questID) or ns.ClassicDBBridge.Turnin(questID)
+  if entry and entry.turnin and not entry.classic and not entry.questie then
+    local name = entry.turnin:match("^([^,]+)") or entry.turnin
+    if classic and classic.mapID and string.lower(classic.name or "") == string.lower(name) then
+      classic.label = entry.turnin
+      return classic
+    end
+    return { name = name, zone = entry.location, label = entry.turnin }
+  end
+  return classic
+end
+
+-- Bag count of an item a quest asks for (0 without an item id).
+local function owned(itemID)
+  return itemID and (ns.InventoryProvider.GetCounts(itemID).bags or 0) or 0
+end
+
+-- Items a quest asks for: live objectives while it is in the log, else the
+-- recorded facts, with `have` counted from the bags.
+-- { { name, count, have, itemID, source } }
+function QuestProvider.RequiredItems(questID)
+  local QF = ns.QuestFactsLearner
+  local state = QuestProvider.State(questID)
+  if state.inLog then
+    local live = QF.LiveItems(questID)
+    if #live > 0 then return live end
+  end
+  local facts = QuestProvider.Facts(questID)
+  local out = {}
+  for _, item in ipairs(facts and facts.items or {}) do
+    out[#out + 1] = { name = item.name, count = item.count or 1, have = owned(item.itemID), itemID = item.itemID, source = item.source }
+  end
+  if #out == 0 and not (facts and facts.items and #facts.items == 0 and facts.learned) then
+    local classicItems = ns.ClassicDBBridge.RequiredItems(questID)
+    local counts = {}
+    for _, item in ipairs(classicItems) do counts[item.itemID] = item.count end
+    -- Questie names the items (it carries no counts; classic-db's count is used when it has one).
+    local questie = ns.QuestieBridge.Quest(questID)
+    if questie and #questie.items > 0 then
+      for _, item in ipairs(questie.items) do
+        out[#out + 1] = { count = counts[item.itemID] or item.count or 1, have = owned(item.itemID), itemID = item.itemID, questie = true }
+      end
+    else
+      for _, item in ipairs(classicItems) do
+        out[#out + 1] = { count = item.count or 1, have = owned(item.itemID), itemID = item.itemID, classic = true }
+      end
+    end
+  end
+  return out
+end
+
+-- The place to go next for a quest: its turn-in once it is ready, its
+-- giver while it is not yet taken; nil while objectives are in progress or
+-- when no map position is recorded. { mapID, x, y, label, name, zone }
+function QuestProvider.Waypoint(questID)
+  local state = QuestProvider.State(questID)
+  if state.completed then return nil end
+  local where
+  if state.ready then where = QuestProvider.Turnin(questID)
+  elseif not state.inLog then where = QuestProvider.Giver(questID) end
+  if where and where.mapID and where.x and where.y then return where end
+  return nil
+end
+
+-- Places the client's map waypoint at a recorded position. Returns ok, message.
+function QuestProvider.SetWaypoint(point)
+  if type(point) ~= "table" then return false, "No map position recorded for this step yet." end
+  local ok, reason = Compat.SetWaypoint(point.mapID, point.x, point.y)
+  if ok then return true, string.format("Waypoint set: %s.", point.label or point.name or "quest") end
+  return false, reason
+end
+
+-- Everything the screens and /fp quest show for one quest:
+-- { entry, state, giver, turnin, items = { { name, count, have, itemID, source } },
+--   rewards = { { name, count, itemID, quality } }, rewardChoice, questline }.
+-- Item and reward names are resolved; `have` is the bag count (or the live
+-- objective while the quest is in the log).
+function QuestProvider.Detail(questID, nameOf)
+  nameOf = nameOf or ns.ItemProvider.GetName
+  local entry = QuestProvider.Get(questID)
+  local detail = {
+    entry = entry, state = QuestProvider.State(questID),
+    giver = QuestProvider.Giver(questID), turnin = QuestProvider.Turnin(questID),
+    items = {}, rewards = {}, rewardChoice = entry and entry.rewardChoice or nil,
+    questline = QuestProvider.Questline(questID),
+  }
+  for _, item in ipairs(QuestProvider.RequiredItems(questID)) do
+    item.name = item.name or (item.itemID and nameOf(item.itemID)) or "?"
+    detail.items[#detail.items + 1] = item
+  end
+  for _, reward in ipairs(entry and entry.rewards or {}) do
+    detail.rewards[#detail.rewards + 1] = { name = reward.name or nameOf(reward.itemID), count = reward.count, itemID = reward.itemID, quality = reward.quality }
+  end
+  return detail
+end
+
+-- "2 x Name, Other" for a detail's rewards.
+function QuestProvider.RewardText(rewards)
+  local parts = {}
+  for _, reward in ipairs(rewards) do parts[#parts + 1] = (reward.count and reward.count > 1 and (reward.count .. " x ") or "") .. reward.name end
+  return table.concat(parts, ", ")
+end
+
+-- Chat lines for one quest.
+function QuestProvider.Describe(questID, nameOf)
+  local detail = QuestProvider.Detail(questID, nameOf)
+  local entry, state = detail.entry, detail.state
+  local lines = {}
+  local label = QuestProvider.StateLabel(state, entry)
+  lines[#lines + 1] = string.format("%s [%s]%s%s%s", QuestProvider.Name(questID), label,
+    entry and entry.level and (" - level " .. entry.level) or "", entry and entry.instance and (" - " .. entry.instance) or "",
+    entry and entry.classic and " (classic data)" or (entry and entry.questie and " (Questie)" or ""))
+  if entry and entry.pickup then lines[#lines + 1] = "  Pick up: " .. entry.pickup end
+  if entry and entry.turnin then lines[#lines + 1] = "  Turn in: " .. entry.turnin end
+  if entry and entry.objective then lines[#lines + 1] = "  " .. entry.objective end
+  if state.inLog and #state.objectives > 0 then lines[#lines + 1] = "  Progress: " .. QuestProvider.ObjectiveText(state) end
+  for _, link in ipairs(entry and entry.chain or {}) do
+    local id = tonumber(link.id)
+    lines[#lines + 1] = string.format("  Requires: %s%s", link.name or ("quest " .. tostring(link.id)), id and QuestProvider.State(id).completed and " (done)" or "")
+  end
+  if detail.giver and not (entry and entry.pickup) then lines[#lines + 1] = "  Pick up: " .. detail.giver.label end
+  if detail.turnin and not (entry and entry.turnin) then lines[#lines + 1] = "  Turn in: " .. detail.turnin.label end
+  for _, item in ipairs(detail.items) do
+    lines[#lines + 1] = string.format("  Needs: %d x %s%s", item.count, item.name, item.have > 0 and string.format(" (%d/%d)", math.min(item.have, item.count), item.count) or "")
+  end
+  local line = detail.questline
+  if line then
+    lines[#lines + 1] = string.format("  Chain: %s - %d of %d steps done", line.attune.name, line.done, line.total)
+    for index, step in ipairs(line.steps) do
+      lines[#lines + 1] = string.format("    %d. [%s] %s: %s%s", index, step.done and "x" or (step.state == StepStates.CURRENT and ">" or " "), step.typeLabel, step.name,
+        step.location and (" - " .. step.location) or "")
+    end
+  end
+  if #detail.rewards > 0 then
+    lines[#lines + 1] = string.format("  Reward%s: %s", detail.rewardChoice and " (choose one)" or "s", QuestProvider.RewardText(detail.rewards))
+  end
+  return lines
+end
+
+local function changed(reason)
+  QuestProvider.logCache = nil
+  Events.Debounce("quests-updated", 0.5, function()
+    Events.Fire("FP_QUESTS_UPDATED", reason)
+  end)
+end
+
+function QuestProvider.Init()
+  if not QuestProvider.IsAvailable() then
+    Log.Debug("C_QuestLog missing; quest provider disabled")
+    return
+  end
+  for _, event in ipairs({ "QUEST_ACCEPTED", "QUEST_TURNED_IN", "QUEST_REMOVED", "QUEST_LOG_UPDATE" }) do
+    Events.RegisterWoW(event, function() changed(event) end)
+  end
+  Events.RegisterWoW("QUEST_DATA_LOAD_RESULT", function(questID, success)
+    local ql = questLog()
+    if success and ql and tonumber(questID) then
+      local title = call(ql.GetTitleForQuestID, questID)
+      if type(title) == "string" and title ~= "" then
+        QuestProvider.titles[tonumber(questID)] = title
+        changed("title")
+      end
+    end
+  end)
+  Events.On("FP_READY", function() QuestProvider.Invalidate() end)
+end

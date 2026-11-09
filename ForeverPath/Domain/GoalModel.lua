@@ -1,0 +1,386 @@
+-- Generic goal model.
+--
+-- A goal is plain data so it serializes straight into SavedVariables:
+--   {
+--     id = "fp-1792147990-3-0421", type = "CRAFT_ITEM", status = "ACTIVE",
+--     target = { itemID = 2996, quantity = 2 },
+--     tracked = true, priority = 1,
+--     createdAt = 1792147990, updatedAt = 1792147990, completedAt = nil, notes = nil,
+--   }
+-- Any target may carry completedBy = "auto" once GoalCompletion completed it.
+-- `target` is type specific:
+--   CRAFT_ITEM / OBTAIN_ITEM   { itemID, quantity, baseline, peak } (baseline and peak:
+--                              GoalCompletion's count when a craft goal started, best gain since)
+--   COMPLETE_ATTUNEMENT        { attuneID, name, icon }
+--   LEARN_RECIPE               { spellID, name, professionName, professionID, icon }
+--   REACH_SKILL                { professionID, professionName, rank, startRank, icon }
+--   COMPLETE_QUEST             { questID, name, level, instance, icon }
+--   REACH_REPUTATION           { factionID, name, standing (1..8), startValue, icon }
+--   APPLY_ENCHANT              { spellID, name, professionName, professionID, icon, quantity, casts }
+local _, ns = ...
+
+local GoalModel = {}
+ns.GoalModel = GoalModel
+
+local Util = ns.Util
+
+local function itemName(target, nameLookup)
+  return (nameLookup and nameLookup(target.itemID)) or ("Item " .. tostring(target.itemID))
+end
+
+local function standingLabel(target)
+  return GoalModel.StandingLabels[target.standing or 0] or "?"
+end
+
+-- Per goal type: label and badge; targetKind; screen, the UI screen that
+-- plans it when that is not Crafting; amount, the target field the
+-- goal's stepper edits and what it is called (nil: nothing to count);
+-- title(target, nameLookup) and name(target, nameLookup) when the generic
+-- "<label>: <target.name>" / target.name does not fit; reopen(target) when a
+-- completed goal reopened starts over.
+GoalModel.Types = {
+  CRAFT_ITEM = { label = "Craft item", badge = "Crafting", targetKind = "item",
+    amount = { field = "quantity", label = "Quantity" },
+    title = function(t, lookup) return string.format("Craft %dx %s", t.quantity or 1, itemName(t, lookup)) end,
+    name = itemName },
+  OBTAIN_ITEM = { label = "Obtain item", badge = "Item", targetKind = "item",
+    amount = { field = "quantity", label = "Quantity" },
+    title = function(t, lookup) return string.format("Obtain %dx %s", t.quantity or 1, itemName(t, lookup)) end,
+    name = itemName },
+  COMPLETE_QUEST = { label = "Complete quest", badge = "Quest", targetKind = "quest", screen = "quests" },
+  REACH_REPUTATION = { label = "Reach reputation", badge = "Reputation", targetKind = "faction", screen = "reputations",
+    title = function(t) return string.format("Reach %s with %s", standingLabel(t), t.name or ("faction " .. tostring(t.factionID))) end,
+    name = function(t) return string.format("%s - %s", t.name or ("Faction " .. tostring(t.factionID)), standingLabel(t)) end },
+  LEARN_RECIPE = { label = "Learn recipe", badge = "Recipe", targetKind = "recipe" },
+  COMPLETE_ATTUNEMENT = { label = "Complete attunement", badge = "Attunement", targetKind = "attunement", screen = "attunements" },
+  REACH_SKILL = { label = "Reach profession skill", badge = "Skill", targetKind = "skill",
+    amount = { field = "rank", label = "Target skill" },
+    title = function(t) return string.format("Reach %s %d", t.professionName or "skill", t.rank or 0) end,
+    name = function(t) return string.format("%s %d", t.professionName or "Skill", t.rank or 0) end },
+  APPLY_ENCHANT = { label = "Apply enchant", badge = "Enchant", targetKind = "enchant",
+    amount = { field = "quantity", label = "Casts" },
+    title = function(t) return string.format("Cast %dx %s", t.quantity or 1, t.name or ("Enchant " .. tostring(t.spellID))) end,
+    reopen = function(t) t.casts = 0 end },
+}
+
+local strictNames = Util.StrictNames
+
+-- GoalModel.TypeIDs.CRAFT_ITEM == "CRAFT_ITEM", one per registered type.
+GoalModel.TypeIDs = strictNames(GoalModel.Types, "goal type")
+
+GoalModel.MAX_SKILL = 1000
+
+-- The routes a goal can pin on an item (goal.routes[itemID]); every other
+-- source the resolver knows (vendor, drop, quest...) is shown, not chosen.
+GoalModel.ROUTE_OVERRIDES = { craft = true, buy = true }
+
+function GoalModel.IsRouteOverride(route)
+  return GoalModel.ROUTE_OVERRIDES[route] == true
+end
+
+-- Goal lifecycle: StatusOrder is the set (and List order); Statuses names it strictly.
+GoalModel.StatusOrder = { ACTIVE = 1, QUEUED = 2, PAUSED = 3, COMPLETED = 4 }
+GoalModel.Statuses = strictNames(GoalModel.StatusOrder, "goal status")
+GoalModel.StatusLabel = { ACTIVE = "Active", QUEUED = "Queued", PAUSED = "Paused", COMPLETED = "Completed" }
+
+local counter = 0
+
+-- Stable unique id: timestamp + per-session counter + random suffix.
+function GoalModel.GenerateID(now, random)
+  counter = counter + 1
+  now = now or Util.Now()
+  local rnd = random and random(0, 9999) or math.random(0, 9999)
+  return string.format("fp-%d-%d-%04d", now, counter, rnd)
+end
+
+local function validateItemTarget(target)
+  if type(target) ~= "table" then
+    return false, "target missing"
+  end
+  if not Util.IsPositiveInt(target.itemID) then
+    return false, "itemID must be a positive integer"
+  end
+  if not Util.IsPositiveInt(target.quantity) then
+    return false, "quantity must be a positive integer"
+  end
+  if target.quantity > 100000 then
+    return false, "quantity is unreasonably large"
+  end
+  return true
+end
+
+local function validateAttunementTarget(target)
+  if type(target) ~= "table" then
+    return false, "target missing"
+  end
+  if (type(target.attuneID) ~= "string" and type(target.attuneID) ~= "number") or tostring(target.attuneID) == "" then
+    return false, "attuneID must be set"
+  end
+  return true
+end
+
+local function validateRecipeTarget(target)
+  if type(target) ~= "table" then
+    return false, "target missing"
+  end
+  if not Util.IsPositiveInt(target.spellID) then
+    return false, "spellID must be a positive integer"
+  end
+  return true
+end
+
+local function validateSkillTarget(target)
+  if type(target) ~= "table" then
+    return false, "target missing"
+  end
+  if type(target.professionName) ~= "string" or target.professionName == "" then
+    return false, "professionName must be set"
+  end
+  if not Util.IsPositiveInt(target.rank) or target.rank > GoalModel.MAX_SKILL then
+    return false, "rank must be a positive integer"
+  end
+  return true
+end
+
+local function validateQuestTarget(target)
+  if type(target) ~= "table" then
+    return false, "target missing"
+  end
+  if not Util.IsPositiveInt(target.questID) then
+    return false, "questID must be a positive integer"
+  end
+  return true
+end
+
+local function validateReputationTarget(target)
+  if type(target) ~= "table" then
+    return false, "target missing"
+  end
+  if not Util.IsPositiveInt(target.factionID) then
+    return false, "factionID must be a positive integer"
+  end
+  if not Util.IsPositiveInt(target.standing) or target.standing > 8 then
+    return false, "standing must be 1 to 8"
+  end
+  return true
+end
+
+local function validateEnchantTarget(target)
+  if type(target) ~= "table" then
+    return false, "target missing"
+  end
+  if not Util.IsPositiveInt(target.spellID) then
+    return false, "spellID must be a positive integer"
+  end
+  if not Util.IsPositiveInt(target.quantity) or target.quantity > 1000 then
+    return false, "quantity must be a positive integer"
+  end
+  return true
+end
+
+local validators = {
+  CRAFT_ITEM = validateItemTarget,
+  OBTAIN_ITEM = validateItemTarget,
+  COMPLETE_ATTUNEMENT = validateAttunementTarget,
+  LEARN_RECIPE = validateRecipeTarget,
+  REACH_SKILL = validateSkillTarget,
+  COMPLETE_QUEST = validateQuestTarget,
+  REACH_REPUTATION = validateReputationTarget,
+  APPLY_ENCHANT = validateEnchantTarget,
+}
+
+GoalModel.StandingLabels = { "Hated", "Hostile", "Unfriendly", "Neutral", "Friendly", "Honored", "Revered", "Exalted" }
+
+-- Target standing of a REACH_REPUTATION goal.
+function GoalModel.SetStanding(goal, standing, now)
+  if goal.type ~= GoalModel.TypeIDs.REACH_REPUTATION then
+    return false, "not a reputation goal"
+  end
+  if not Util.IsPositiveInt(standing) or standing > 8 then
+    return false, "standing must be 1 to 8"
+  end
+  goal.target.standing = standing
+  goal.updatedAt = now or Util.Now()
+  return true
+end
+
+-- False for types this version does not know (e.g. a goal saved by a newer one).
+function GoalModel.IsSupported(goalType)
+  return GoalModel.Types[goalType] ~= nil
+end
+
+function GoalModel.ValidateTarget(goalType, target)
+  local def = GoalModel.Types[goalType]
+  if not def then
+    return false, "unknown goal type"
+  end
+  local validator = validators[goalType]
+  if validator then
+    return validator(target)
+  end
+  if type(target) ~= "table" then
+    return false, "target missing"
+  end
+  return true
+end
+
+-- Creates a new goal. opts.now / opts.random allow deterministic tests.
+function GoalModel.New(goalType, target, opts)
+  opts = opts or {}
+  local ok, err = GoalModel.ValidateTarget(goalType, target)
+  if not ok then
+    return nil, err
+  end
+  local now = opts.now or Util.Now()
+  return {
+    id = GoalModel.GenerateID(now, opts.random),
+    type = goalType,
+    status = GoalModel.Statuses.ACTIVE,
+    target = Util.DeepCopy(target),
+    tracked = opts.tracked ~= false,
+    priority = opts.priority,
+    createdAt = now,
+    updatedAt = now,
+    notes = opts.notes,
+  }
+end
+
+-- Validates a goal read from saved data.
+function GoalModel.Validate(goal)
+  if type(goal) ~= "table" then
+    return false, "goal is not a table"
+  end
+  if type(goal.id) ~= "string" or goal.id == "" then
+    return false, "missing id"
+  end
+  if type(goal.type) ~= "string" or not GoalModel.Types[goal.type] then
+    return false, "unknown type"
+  end
+  local ok, err = GoalModel.ValidateTarget(goal.type, goal.target)
+  if not ok then
+    return false, err
+  end
+  if goal.status ~= nil and not GoalModel.StatusOrder[goal.status] then
+    return false, "unknown status"
+  end
+  if goal.createdAt ~= nil and type(goal.createdAt) ~= "number" then
+    return false, "createdAt not a number"
+  end
+  if goal.tracked ~= nil and type(goal.tracked) ~= "boolean" then
+    return false, "tracked not a boolean"
+  end
+  if goal.priority ~= nil and type(goal.priority) ~= "number" then
+    return false, "priority not a number"
+  end
+  if goal.routes ~= nil then
+    if type(goal.routes) ~= "table" then
+      return false, "routes not a table"
+    end
+    for itemID, route in pairs(goal.routes) do
+      if type(itemID) ~= "number" or not GoalModel.IsRouteOverride(route) then
+        return false, "invalid route"
+      end
+    end
+  end
+  return true
+end
+
+function GoalModel.SetQuantity(goal, quantity, now)
+  if not Util.IsPositiveInt(quantity) then
+    return false, "quantity must be a positive integer"
+  end
+  if type(goal.target) ~= "table" then
+    return false, "goal has no target"
+  end
+  goal.target.quantity = quantity
+  goal.updatedAt = now or Util.Now()
+  return true
+end
+
+-- Target skill of a REACH_SKILL goal.
+function GoalModel.SetRank(goal, rank, now)
+  if goal.type ~= GoalModel.TypeIDs.REACH_SKILL then
+    return false, "not a skill goal"
+  end
+  if not Util.IsPositiveInt(rank) or rank > GoalModel.MAX_SKILL then
+    return false, "rank must be a positive integer"
+  end
+  goal.target.rank = rank
+  goal.updatedAt = now or Util.Now()
+  return true
+end
+
+-- How many casts of an enchant goal's spell have been seen.
+function GoalModel.SetCasts(goal, casts, now)
+  if goal.type ~= GoalModel.TypeIDs.APPLY_ENCHANT then
+    return false, "not an enchant goal"
+  end
+  if type(casts) ~= "number" or casts < 0 or casts ~= math.floor(casts) then
+    return false, "casts must be a whole number"
+  end
+  goal.target.casts = casts
+  goal.updatedAt = now or Util.Now()
+  return true
+end
+
+function GoalModel.SetStatus(goal, status, now)
+  if not GoalModel.StatusOrder[status] then
+    return false, "unknown status"
+  end
+  local def = GoalModel.Types[goal.type]
+  if goal.status == GoalModel.Statuses.COMPLETED and status ~= GoalModel.Statuses.COMPLETED and def and def.reopen then
+    def.reopen(goal.target)
+  end
+  goal.status = status
+  goal.updatedAt = now or Util.Now()
+  if status == GoalModel.Statuses.COMPLETED then
+    goal.completedAt = goal.updatedAt
+  else
+    goal.completedAt = nil
+  end
+  return true
+end
+
+function GoalModel.IsOpen(goal)
+  return goal.status ~= GoalModel.Statuses.COMPLETED
+end
+
+-- Short title such as "Craft 2x Bolt of Linen Cloth". nameLookup(itemID) is optional.
+function GoalModel.Title(goal, nameLookup)
+  local def = GoalModel.Types[goal.type]
+  local label = def and def.label or goal.type
+  if def and def.title and goal.target then
+    return def.title(goal.target, nameLookup)
+  end
+  if goal.target and type(goal.target.name) == "string" then
+    return string.format("%s: %s", label, goal.target.name)
+  end
+  return label
+end
+
+-- Name only (for the design's name-first rows); falls back to "Item 1234".
+function GoalModel.Name(goal, nameLookup)
+  local def = GoalModel.Types[goal.type]
+  if def and def.name and goal.target then
+    return def.name(goal.target, nameLookup)
+  end
+  if goal.target and type(goal.target.name) == "string" then
+    return goal.target.name
+  end
+  return def and def.label or goal.type
+end
+
+-- What the goal counts: amount (the type's { field, label }) and its current
+-- value, or nil for goals with nothing to count.
+function GoalModel.Amount(goal)
+  local def = GoalModel.Types[goal.type]
+  local amount = def and def.amount
+  if not amount or not goal.target then return nil end
+  return amount, goal.target[amount.field] or 1
+end
+
+-- The "x3" multiplier shown beside a goal's name: its quantity, else 1.
+function GoalModel.ShownQuantity(goal)
+  local amount, value = GoalModel.Amount(goal)
+  return amount and amount.field == "quantity" and value or 1
+end

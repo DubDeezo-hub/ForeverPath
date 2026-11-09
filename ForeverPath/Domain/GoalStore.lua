@@ -1,0 +1,315 @@
+-- Goal collection over a storage table (the per-character SavedVariables).
+-- Pure Lua: the storage table is injected, change notifications go through an
+-- optional callback so this file has no dependency on the event bus or UI.
+local _, ns = ...
+
+local GoalModel = ns.GoalModel
+local Util = ns.Util
+
+local GoalStore = {}
+GoalStore.__index = GoalStore
+ns.GoalStore = GoalStore
+
+-- storage: table with `goals` (id -> goal) and `selectedGoalId`.
+-- opts.onChange(event, goal) is called after every mutation.
+-- opts.now() overrides the clock.
+function GoalStore.New(storage, opts)
+  opts = opts or {}
+  if type(storage) ~= "table" then
+    storage = {}
+  end
+  if type(storage.goals) ~= "table" then
+    storage.goals = {}
+  end
+  local self = setmetatable({
+    storage = storage,
+    onChange = opts.onChange,
+    now = opts.now or Util.Now,
+    dropped = 0,
+  }, GoalStore)
+  self.dropped = self:Sanitize()
+  return self
+end
+
+local function notify(self, event, goal)
+  if self.onChange then
+    self.onChange(event, goal)
+  end
+end
+
+-- Drops malformed entries (corrupted saved data, hand edits). Returns the count.
+-- Goals of a type this version does not know (saved by a newer one) are
+-- parked in storage.parkedGoals, untouched, and come back as soon as a
+-- version that knows the type loads. Anything else malformed is dropped.
+-- Returns the number dropped.
+function GoalStore:Sanitize()
+  local dropped = 0
+  local parked = type(self.storage.parkedGoals) == "table" and self.storage.parkedGoals or {}
+  self.storage.parkedGoals = parked
+  for id, goal in pairs(parked) do
+    if type(goal) == "table" and GoalModel.IsSupported(goal.type) and self.storage.goals[id] == nil then
+      self.storage.goals[id] = goal
+      parked[id] = nil
+    end
+  end
+  for id, goal in pairs(self.storage.goals) do
+    if type(goal) == "table" and type(goal.type) == "string" and not GoalModel.IsSupported(goal.type) then
+      parked[id] = goal
+      self.storage.goals[id] = nil
+    end
+  end
+  for id, goal in pairs(self.storage.goals) do
+    local ok = GoalModel.Validate(goal)
+    if not ok or goal.id ~= id then
+      self.storage.goals[id] = nil
+      dropped = dropped + 1
+    else
+      if goal.status == nil then goal.status = GoalModel.Statuses.ACTIVE end
+      if goal.tracked == nil then goal.tracked = true end
+    end
+  end
+  if self.storage.selectedGoalId and not self.storage.goals[self.storage.selectedGoalId] then
+    self.storage.selectedGoalId = nil
+  end
+  return dropped
+end
+
+function GoalStore:Add(goal)
+  local ok, err = GoalModel.Validate(goal)
+  if not ok then
+    return nil, err
+  end
+  if self.storage.goals[goal.id] then
+    return nil, "duplicate goal id"
+  end
+  if goal.priority == nil then
+    goal.priority = self:Count({ open = true }) + 1
+  end
+  self.storage.goals[goal.id] = goal
+  notify(self, "added", goal)
+  return goal
+end
+
+function GoalStore:Create(goalType, target, opts)
+  local goal, err = GoalModel.New(goalType, target, opts)
+  if not goal then
+    return nil, err
+  end
+  return self:Add(goal)
+end
+
+function GoalStore:Get(id)
+  if id == nil then return nil end
+  return self.storage.goals[id]
+end
+
+local function matches(goal, filter)
+  if not filter then return true end
+  if filter.open ~= nil and GoalModel.IsOpen(goal) ~= filter.open then return false end
+  if filter.status and goal.status ~= filter.status then return false end
+  if filter.tracked ~= nil and (goal.tracked and true or false) ~= filter.tracked then return false end
+  return true
+end
+
+function GoalStore:Count(filter)
+  local n = 0
+  for _, goal in pairs(self.storage.goals) do
+    if matches(goal, filter) then n = n + 1 end
+  end
+  return n
+end
+
+local function compare(a, b)
+  local sa, sb = GoalModel.StatusOrder[a.status] or 9, GoalModel.StatusOrder[b.status] or 9
+  if sa ~= sb then return sa < sb end
+  local pa, pb = a.priority or math.huge, b.priority or math.huge
+  if pa ~= pb then return pa < pb end
+  local ca, cb = a.createdAt or 0, b.createdAt or 0
+  if ca ~= cb then return ca < cb end
+  return a.id < b.id
+end
+
+-- Goals ordered by status group, priority, creation time. filter: { open=, status=, tracked= }
+function GoalStore:List(filter)
+  local list = {}
+  for _, goal in pairs(self.storage.goals) do
+    if matches(goal, filter) then
+      list[#list + 1] = goal
+    end
+  end
+  table.sort(list, compare)
+  return list
+end
+
+function GoalStore:Remove(id)
+  local goal = self.storage.goals[id]
+  if not goal then
+    return nil, "no such goal"
+  end
+  self.storage.goals[id] = nil
+  if self.storage.selectedGoalId == id then
+    local remaining = self:List({ open = true })
+    self.storage.selectedGoalId = remaining[1] and remaining[1].id or nil
+  end
+  self:Renumber()
+  notify(self, "removed", goal)
+  return goal
+end
+
+function GoalStore:Select(id)
+  if id ~= nil and not self.storage.goals[id] then
+    return false, "no such goal"
+  end
+  if self.storage.selectedGoalId == id then
+    return true
+  end
+  self.storage.selectedGoalId = id
+  notify(self, "selected", self.storage.goals[id])
+  return true
+end
+
+function GoalStore:SelectedID()
+  return self.storage.selectedGoalId
+end
+
+function GoalStore:Selected()
+  return self:Get(self.storage.selectedGoalId)
+end
+
+-- The one write path: applies change(goal, now) -> ok, err to a stored goal
+-- and announces it when it succeeds. opts.target merges extra target fields
+-- (startRank, startValue, completedBy) before the announcement;
+-- opts.renumber re-sequences priorities first (status changes); opts.silent
+-- skips the announcement (completion bookkeeping the player never sees).
+function GoalStore:Update(id, change, opts)
+  local goal = self.storage.goals[id]
+  if not goal then
+    return false, "no such goal"
+  end
+  local ok, err = change(goal, self.now())
+  if not ok then
+    return false, err
+  end
+  for field, value in pairs(opts and opts.target or {}) do goal.target[field] = value end
+  if opts and opts.renumber then self:Renumber() end
+  if not (opts and opts.silent) then notify(self, "updated", goal) end
+  return true
+end
+
+-- Setters over the GoalModel rules: each returns true, or false, reason.
+-- target (optional) is extra target fields written with the change.
+function GoalStore:SetQuantity(id, quantity)
+  return self:Update(id, function(goal, now) return GoalModel.SetQuantity(goal, quantity, now) end)
+end
+
+function GoalStore:SetRank(id, rank, target)
+  return self:Update(id, function(goal, now) return GoalModel.SetRank(goal, rank, now) end, { target = target })
+end
+
+function GoalStore:SetStanding(id, standing, target)
+  return self:Update(id, function(goal, now) return GoalModel.SetStanding(goal, standing, now) end, { target = target })
+end
+
+function GoalStore:SetCasts(id, casts)
+  return self:Update(id, function(goal, now) return GoalModel.SetCasts(goal, casts, now) end)
+end
+
+function GoalStore:SetStatus(id, status, target)
+  return self:Update(id, function(goal, now) return GoalModel.SetStatus(goal, status, now) end, { renumber = true, target = target })
+end
+
+function GoalStore:SetTracked(id, tracked)
+  return self:Update(id, function(goal, now)
+    goal.tracked = tracked and true or false
+    goal.updatedAt = now
+    return true
+  end)
+end
+
+-- An item goal's completion bookkeeping (baseline, peak); not announced.
+function GoalStore:SetProgress(id, progress)
+  return self:Update(id, function() return true end, { target = progress, silent = true })
+end
+
+-- Switches a goal between types that share the same target shape
+-- (CRAFT_ITEM <-> OBTAIN_ITEM).
+function GoalStore:SetType(id, goalType)
+  return self:Update(id, function(goal, now)
+    local def = GoalModel.Types[goalType]
+    if not def then
+      return false, "unknown goal type"
+    end
+    local current = GoalModel.Types[goal.type]
+    if not current or current.targetKind ~= def.targetKind then
+      return false, "goal types have different targets"
+    end
+    local ok, err = GoalModel.ValidateTarget(goalType, goal.target)
+    if not ok then
+      return false, err
+    end
+    if goal.type ~= goalType then
+      goal.type = goalType
+      goal.updatedAt = now
+    end
+    return true
+  end)
+end
+
+-- Forces how a reagent is obtained for this goal: "craft", "buy" or nil (default).
+function GoalStore:SetRoute(id, itemID, route)
+  return self:Update(id, function(goal, now)
+    if type(itemID) ~= "number" then
+      return false, "itemID must be a number"
+    end
+    if route ~= nil and not GoalModel.IsRouteOverride(route) then
+      return false, "route must be craft, buy or nil"
+    end
+    goal.routes = goal.routes or {}
+    goal.routes[itemID] = route
+    if next(goal.routes) == nil then goal.routes = nil end
+    goal.updatedAt = now
+    return true
+  end)
+end
+
+-- Assigns sequential priorities to open goals in their current order.
+function GoalStore:Renumber()
+  for index, goal in ipairs(self:List({ open = true })) do
+    goal.priority = index
+  end
+end
+
+-- Moves an open goal to position `position` (1 = highest priority).
+function GoalStore:SetPriority(id, position)
+  local goal = self.storage.goals[id]
+  if not goal or not GoalModel.IsOpen(goal) then
+    return false, "no such open goal"
+  end
+  local open = self:List({ open = true })
+  local ordered = {}
+  for _, g in ipairs(open) do
+    if g.id ~= id then ordered[#ordered + 1] = g end
+  end
+  position = Util.Clamp(Util.ParseInt(position) or 1, 1, #ordered + 1)
+  table.insert(ordered, position, goal)
+  for index, g in ipairs(ordered) do
+    g.priority = index
+  end
+  goal.updatedAt = self.now()
+  notify(self, "updated", goal)
+  return true
+end
+
+-- Finds the first goal (in List order) of `goalType` whose target[field]
+-- equals `value`. `normalize`, when given, is applied to both sides first.
+function GoalStore:FindByTarget(goalType, field, value, normalize)
+  if normalize then value = normalize(value) end
+  for _, goal in ipairs(self:List()) do
+    if goal.type == goalType and goal.target then
+      local current = goal.target[field]
+      if normalize then current = normalize(current) end
+      if current == value then return goal end
+    end
+  end
+  return nil
+end

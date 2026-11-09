@@ -1,0 +1,401 @@
+-- Consolidated shopping list across goals. Pure Lua over Planner views.
+--
+-- Every node of every included goal's dependency tree contributes to one row
+-- per item: how many units the goals need in total, how many the inventory
+-- covers, how many are held by goals that are not on the list (reserved) and
+-- how many are still missing. Rows are classified by how the player is
+-- expected to get the item (Auction House, vendor, gathering, craft, alt).
+local _, ns = ...
+local Routes = ns.DependencyResolver.Routes
+local Steps = ns.DependencyResolver.Steps
+
+local GoalModel = ns.GoalModel
+
+local ShoppingList = {}
+ns.ShoppingList = ShoppingList
+
+ShoppingList.Categories = { "buy", "vendor", "gather", "craft", "learn", "alt" }
+ShoppingList.CategoryLabels = { buy = "Auction House", vendor = "Vendors", gather = "Gathering / drops", craft = "Craftable", learn = "Recipes to learn", alt = "From alts" }
+
+local ROUTE_CATEGORY = { buy = "buy", vendor = "vendor", gather = "gather", drop = "gather", quest = "gather", craft = "craft", alt = "alt", altcraft = "alt" }
+
+-- Default membership: active and queued goals are on the list, paused are not.
+function ShoppingList.DefaultIncluded(goal)
+  return goal.status == GoalModel.Statuses.ACTIVE or goal.status == GoalModel.Statuses.QUEUED
+end
+
+local function sourceLabels(node)
+  local labels = {}
+  local function add(label)
+    for _, existing in ipairs(labels) do
+      if existing == label then return end
+    end
+    labels[#labels + 1] = label
+  end
+  if node.learn then
+    add("Recipe" .. (node.learnFor and (": teaches " .. node.learnFor) or ""))
+  elseif node.tool then
+    add("Tool" .. (node.toolFor and (" for " .. node.toolFor) or ""))
+  end
+  if node.route == Routes.CRAFT and node.craft then
+    if node.craft.combine then
+      add("Combine")
+    else
+      local who = node.craft.unavailable and (" (" .. node.craft.unavailable .. ")")
+        or (node.craft.crafter and not node.craft.crafter.isCurrent and (" on " .. node.craft.crafter.name)) or ""
+      add("Craft - " .. (node.craft.professionName or "?") .. who)
+    end
+  elseif node.route == Routes.ALT and node.hint then
+    add("Alt: " .. (node.hint.name or "?"))
+  elseif node.route == Routes.ALTCRAFT and node.hint then
+    add("Craft - Alt: " .. (node.hint.name or "?"))
+  end
+  if node.soulbound then add("Soulbound") end
+  for _, option in ipairs(node.options or {}) do
+    if option.kind == Routes.BUY and not option.unavailable then
+      add("AH")
+    elseif option.kind == Routes.VENDOR then
+      add("Vendor: " .. (option.name or "?"))
+    elseif (option.kind == Routes.GATHER or option.kind == Routes.DROP or option.kind == Routes.QUEST) and not option.unavailable then
+      add(option.short or option.label or ns.DependencyResolver.RouteLabels[option.kind] or option.kind)
+    elseif option.kind == Routes.CRAFT and node.route ~= Routes.CRAFT then
+      if option.learned then
+        add("Craft - " .. (option.professionName or "?"))
+      elseif option.combine then
+        add("Combine")
+      else
+        add("Recipe not learned" .. (option.reason and (" - " .. option.reason) or ""))
+      end
+    end
+  end
+  return labels
+end
+
+-- Plans to get and recipes to train are listed together; a soulbound item
+-- with no real route is listed with drops, not the Auction House.
+local function categoryFor(node)
+  if node.step or node.learn then return "learn" end
+  local category = ROUTE_CATEGORY[node.route] or "buy"
+  if category == "buy" and node.soulbound then return "gather" end
+  return category
+end
+
+local stepLabel = ns.DependencyResolver.TrainLabel
+
+-- Affordability of one amount against the gold you carry and the account's.
+-- gold = { current = copper|nil, account = copper|nil }
+-- Returns "now" | "account" | "no" | nil (no gold information).
+function ShoppingList.Affordable(cost, gold)
+  if type(cost) ~= "number" or type(gold) ~= "table" then return nil end
+  if type(gold.current) == "number" and cost <= gold.current then return "now" end
+  if type(gold.account) == "number" and cost <= gold.account then return "account" end
+  if type(gold.current) == "number" or type(gold.account) == "number" then return "no" end
+  return nil
+end
+
+-- Appends value to list unless it is already there.
+local function addUnique(list, value)
+  for _, existing in ipairs(list) do
+    if existing == value then return end
+  end
+  list[#list + 1] = value
+end
+
+-- A tree's nodes shallowest first, then by key, so a row that several nodes
+-- feed takes its category, hint and zone from the same node every time.
+local function orderedNodes(tree)
+  local nodes = {}
+  for _, node in pairs(tree.byKey) do nodes[#nodes + 1] = node end
+  table.sort(nodes, function(a, b)
+    if a.depth ~= b.depth then return a.depth < b.depth end
+    return a.key < b.key
+  end)
+  return nodes
+end
+
+-- Whether a node is something to get: a craft done for skill points is not
+-- (its reagents are), a train step is.
+local function isShoppingNode(node)
+  return (node.claims or node.depth > 0 or (node.step and node.step.kind == Steps.TRAIN)) and not node.forSkill
+end
+
+-- Folds one missing node's category, hint, sources and alt holders into its row.
+local function addMissingNode(r, node)
+  if not r.category then r.category = categoryFor(node) end
+  if node.hint and not r.hint then r.hint = node.hint end
+  if node.hint and node.hint.zone and not r.zone then r.zone = node.hint.zone end
+  if node.learn then r.learn = true end
+  if node.step then
+    addUnique(r.sources, stepLabel(node.step))
+    if node.step.trainer and tonumber(node.step.trainer.cost) then r.stepCost = node.step.trainer.cost end
+  end
+  for _, label in ipairs(sourceLabels(node)) do addUnique(r.sources, label) end
+  for _, alt in ipairs(node.altSources or {}) do
+    r.altHolders[alt.name] = math.max(r.altHolders[alt.name] or 0, alt.count)
+  end
+  for _, option in ipairs(node.options or {}) do
+    if option.kind == Routes.ALT and option.name then
+      r.altHolders[option.name] = math.max(r.altHolders[option.name] or 0, option.count or 0)
+    end
+  end
+end
+
+-- Step 1: one row per item (a train step per spell) over every included
+-- goal's tree. Returns rows, goals, claimedByExcluded (units excluded goals
+-- hold), stock (units physically there per item).
+local function collectRows(entries, included, bought, nameOf)
+  local rows, goals, byItem = {}, {}, {}
+  local claimedByExcluded, stock = {}, {}
+  -- Rows are keyed by item id; a train step by "train:<spellID>".
+  local function row(key, itemID, step)
+    local r = byItem[key]
+    if not r then
+      r = { key = key, itemID = itemID, step = step, name = step and step.name or nil, total = 0, owned = 0, reserved = 0, missing = 0,
+        category = nil, sources = {}, goals = {}, altHolders = {}, bought = bought[key] == true }
+      byItem[key] = r
+      rows[#rows + 1] = r
+    end
+    return r
+  end
+  for _, entry in ipairs(entries or {}) do
+    local goal, view = entry.goal, entry.view
+    local isIncluded = included(goal) and true or false
+    local goalName = GoalModel.Name(goal, nameOf)
+    goals[#goals + 1] = { goal = goal, included = isIncluded, name = goalName, quantity = goal.target and goal.target.quantity or 1 }
+    local tree = view and view.tree
+    for _, node in ipairs(tree and tree.byKey and orderedNodes(tree) or {}) do
+      if isShoppingNode(node) then
+        if node.itemID then
+          local full = (node.available or 0) + (node.reserved or 0)
+          if full > (stock[node.itemID] or 0) then stock[node.itemID] = full end
+        end
+        if isIncluded then
+          local key = node.itemID or ("train:" .. tostring(node.step and node.step.spellID or node.key))
+          local r = row(key, node.itemID, node.step)
+          r.total = r.total + node.quantity
+          r.owned = r.owned + (node.owned or 0)
+          r.missing = r.missing + (node.missing or 0)
+          if node.missing > 0 then addMissingNode(r, node) end
+          addUnique(r.goals, goalName)
+        elseif node.itemID then
+          claimedByExcluded[node.itemID] = (claimedByExcluded[node.itemID] or 0) + (node.owned or 0)
+        end
+      end
+    end
+  end
+  return rows, goals, claimedByExcluded, stock
+end
+
+-- Step 2: a kept row's owned / reserved split. Owned = units physically
+-- there for this row (capped at Total); Reserved = the part of Owned held by
+-- goals not on the list; Missing = Total - usable.
+local function settleRow(r, claimedByExcluded, stock)
+  r.category = r.category or "buy"
+  r.usable = r.owned
+  local held = r.itemID and math.min(claimedByExcluded[r.itemID] or 0, math.max(0, (stock[r.itemID] or 0) - r.usable)) or 0
+  r.owned = math.min(r.total, r.usable + held)
+  r.reserved = r.owned - r.usable
+  r.farm = ns.Farming.Estimate(r.hint, r.missing)
+end
+
+-- Step 3: the estimated cost from the price boundary (vendor and AH prices);
+-- a train step costs what the trainer charges.
+local function priceRow(r, result, opts)
+  local info = not r.step and r.itemID and opts.priceOf and opts.priceOf(r.itemID) or nil
+  local unit = r.step and r.stepCost or (type(info) == "table" and info.copper) or nil
+  if type(unit) == "number" then
+    r.unitPrice = unit
+    r.cost = unit * r.missing
+    result.cost.known = result.cost.known + r.cost
+    result.cost.pricedRows = result.cost.pricedRows + 1
+    if r.bought then
+      result.cost.bought = result.cost.bought + r.cost
+    else
+      result.cost.remaining = result.cost.remaining + r.cost
+    end
+    r.affordable = ShoppingList.Affordable(r.cost, opts.gold)
+  elseif r.category ~= "craft" and r.category ~= "alt" then
+    result.cost.unpricedRows = result.cost.unpricedRows + 1
+  end
+end
+
+-- Step 4: which alt can mail how much of a row, most first.
+local function planMail(r, mail)
+  local remaining = r.missing
+  local holders = {}
+  for name, count in pairs(r.altHolders) do holders[#holders + 1] = { name = name, count = count } end
+  table.sort(holders, function(a, b)
+    if a.count ~= b.count then return a.count > b.count end
+    return a.name < b.name
+  end)
+  for _, holder in ipairs(holders) do
+    if remaining <= 0 then break end
+    local send = math.min(remaining, holder.count)
+    if send > 0 then
+      local plan
+      for _, m in ipairs(mail) do if m.name == holder.name then plan = m end end
+      if not plan then
+        plan = { name = holder.name, items = {}, units = 0 }
+        mail[#mail + 1] = plan
+      end
+      plan.items[#plan.items + 1] = { itemID = r.itemID, count = send }
+      plan.units = plan.units + send
+      remaining = remaining - send
+    end
+  end
+end
+
+-- Step 5: can you pay for what is still to buy? Current gold first, then the
+-- account (alts' snapshotted gold, reachable by mailing).
+local function affordability(remaining, unpriced, gold)
+  local aff = { remaining = remaining, unpriced = unpriced, status = "unknown" }
+  if type(gold) == "table" and (type(gold.current) == "number" or type(gold.account) == "number") then
+    aff.current = gold.current
+    aff.account = gold.account
+    aff.status = ShoppingList.Affordable(remaining, gold) or "unknown"
+    if type(gold.current) == "number" then aff.shortNow = math.max(0, remaining - gold.current) end
+    if type(gold.account) == "number" then aff.shortAccount = math.max(0, remaining - gold.account) end
+    if type(gold.current) == "number" and type(gold.account) == "number" then aff.altsGold = math.max(0, gold.account - gold.current) end
+  end
+  return aff
+end
+
+-- entries: { { goal, view } } in priority order.
+-- opts.included(goal) -> bool (default ShoppingList.DefaultIncluded)
+-- opts.bought = { [itemID] = true }
+-- opts.nameOf(itemID)
+-- opts.priceOf(itemID) -> priceInfo { copper, ... } | nil (unknown), as PriceProvider.GetPrice and CraftWise
+-- opts.gold = { current = copper, account = copper } (optional; enables affordability)
+function ShoppingList.Build(entries, opts)
+  opts = opts or {}
+  local nameOf = opts.nameOf or function(itemID) return "Item " .. tostring(itemID) end
+  local result = {
+    rows = {}, goals = {},
+    counts = { all = 0, buy = 0, vendor = 0, gather = 0, craft = 0, learn = 0, alt = 0, bought = 0 },
+    units = { total = 0, owned = 0, missing = 0, reserved = 0 },
+    cost = { known = 0, pricedRows = 0, unpricedRows = 0, bought = 0, remaining = 0 },
+    mail = {},
+  }
+  local rows, claimedByExcluded, stock
+  rows, result.goals, claimedByExcluded, stock = collectRows(entries, opts.included or ShoppingList.DefaultIncluded, opts.bought or {}, nameOf)
+  -- Only rows that still need something are listed.
+  for _, r in ipairs(rows) do
+    if r.missing > 0 then
+      settleRow(r, claimedByExcluded, stock)
+      result.rows[#result.rows + 1] = r
+      result.counts.all = result.counts.all + 1
+      result.counts[r.category] = (result.counts[r.category] or 0) + 1
+      if r.bought then result.counts.bought = result.counts.bought + 1 end
+      result.units.total = result.units.total + r.total
+      result.units.owned = result.units.owned + r.usable
+      result.units.missing = result.units.missing + r.missing
+      result.units.reserved = result.units.reserved + r.reserved
+      priceRow(r, result, opts)
+      planMail(r, result.mail)
+    end
+  end
+  table.sort(result.mail, function(a, b)
+    if a.units ~= b.units then return a.units > b.units end
+    return a.name < b.name
+  end)
+  result.units.percent = result.units.total > 0 and math.floor(result.units.owned * 100 / result.units.total + 0.5) or 100
+  ShoppingList.Sort(result.rows, opts.sort or "missing", nameOf)
+  result.affordability = affordability(result.cost.remaining, result.cost.unpricedRows, opts.gold)
+  return result
+end
+
+-- Sorts rows in place: "missing" (default), "name", "total", "source",
+-- "zone" (where the chosen source is; rows without a place last).
+function ShoppingList.Sort(rows, key, nameOf)
+  nameOf = nameOf or function(itemID) return tostring(itemID) end
+  local order = { buy = 1, vendor = 2, gather = 3, craft = 4, learn = 5, alt = 6 }
+  local function label(r) return r.name or nameOf(r.itemID) end
+  table.sort(rows, function(a, b)
+    if a.bought ~= b.bought then return not a.bought end
+    if key == "name" then
+      local na, nb = label(a), label(b)
+      if na ~= nb then return na < nb end
+    elseif key == "total" then
+      if a.total ~= b.total then return a.total > b.total end
+    elseif key == "source" then
+      local oa, ob = order[a.category] or 9, order[b.category] or 9
+      if oa ~= ob then return oa < ob end
+      if a.missing ~= b.missing then return a.missing > b.missing end
+    elseif key == "zone" then
+      local za, zb = a.zone or "~", b.zone or "~"
+      if za ~= zb then return za < zb end
+      local oa, ob = order[a.category] or 9, order[b.category] or 9
+      if oa ~= ob then return oa < ob end
+      if a.missing ~= b.missing then return a.missing > b.missing end
+    else
+      if a.missing ~= b.missing then return a.missing > b.missing end
+    end
+    if a.itemID and b.itemID then return a.itemID < b.itemID end
+    return tostring(a.key or a.itemID) < tostring(b.key or b.itemID)
+  end)
+  return rows
+end
+
+-- Rows matching a filter tab ("all" or a category).
+function ShoppingList.Filter(rows, category)
+  if not category or category == "all" then return rows end
+  local out = {}
+  for _, r in ipairs(rows) do
+    if r.category == category then out[#out + 1] = r end
+  end
+  return out
+end
+
+-- One sentence on whether the remaining cost is payable.
+function ShoppingList.AffordabilityText(aff)
+  local moneyFn = ns.Util.Money
+  if not aff or aff.status == "unknown" then return nil end
+  local unpriced = aff.unpriced > 0 and string.format(" (%d item%s unpriced)", aff.unpriced, aff.unpriced == 1 and "" or "s") or ""
+  if aff.remaining <= 0 then
+    return "Nothing left to pay for" .. unpriced
+  end
+  if aff.status == "now" then
+    return string.format("Affordable now: %s of your %s%s", moneyFn(aff.remaining), moneyFn(aff.current), unpriced)
+  elseif aff.status == "account" then
+    return string.format("Short by %s on this character; alts hold %s, so the account covers it%s", moneyFn(aff.shortNow), moneyFn(aff.altsGold or 0), unpriced)
+  end
+  if aff.shortAccount then
+    return string.format("Not affordable: short by %s even with every character's gold%s", moneyFn(aff.shortAccount), unpriced)
+  end
+  return string.format("Not affordable: short by %s%s", moneyFn(aff.shortNow or aff.remaining), unpriced)
+end
+
+-- Chat-ready lines. linkOf(itemID) may return an item link; falls back to the name.
+function ShoppingList.Lines(list, nameOf, linkOf)
+  nameOf = nameOf or function(itemID) return "Item " .. tostring(itemID) end
+  local lines = {}
+  local goalNames = {}
+  for _, g in ipairs(list.goals) do
+    if g.included then goalNames[#goalNames + 1] = g.name end
+  end
+  lines[#lines + 1] = string.format("Shopping list (%d item%s for %s): %d of %d units in hand",
+    #list.rows, #list.rows == 1 and "" or "s", #goalNames > 0 and table.concat(goalNames, ", ") or "no goals",
+    list.units.owned, list.units.total)
+  local affordText = ShoppingList.AffordabilityText(list.affordability)
+  if affordText then
+    lines[#lines + 1] = "  Cost: " .. affordText
+  end
+  for _, r in ipairs(list.rows) do
+    if r.step then
+      lines[#lines + 1] = string.format("  %sTrain %s - %s%s", r.bought and "[done] " or "", r.name or "recipe",
+        #r.sources > 0 and table.concat(r.sources, ", ") or "trainer",
+        r.cost and (" - " .. ns.Util.Money(r.cost)) or "")
+    else
+      local label = linkOf and linkOf(r.itemID) or nameOf(r.itemID)
+      lines[#lines + 1] = string.format("  %s%d x %s - %s%s", r.bought and "[bought] " or "", r.missing, label,
+        #r.sources > 0 and table.concat(r.sources, ", ") or ShoppingList.CategoryLabels[r.category] or "?",
+        r.reserved > 0 and string.format(" (%d reserved by other goals)", r.reserved) or "")
+    end
+  end
+  for _, plan in ipairs(list.mail) do
+    local parts = {}
+    for _, item in ipairs(plan.items) do parts[#parts + 1] = string.format("%d x %s", item.count, nameOf(item.itemID)) end
+    lines[#lines + 1] = string.format("  Mail from %s: %s", plan.name, table.concat(parts, ", "))
+  end
+  return lines
+end

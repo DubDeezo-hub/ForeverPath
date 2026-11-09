@@ -1,0 +1,281 @@
+-- Client compatibility layer: which client this is, and the modern-or-legacy
+-- choice for the APIs several modules share (items, containers, addons,
+-- merchants, quest flags, maps, player context, trainer window, item stats),
+-- so those modules never ask "which client is this?". A provider that wraps
+-- one API family on its own (ReputationProvider's faction API,
+-- ProfessionProvider's C_TradeSkillUI) keeps that choice inside it.
+--
+-- World of Warcraft: Forever (interface 16001) is a Retail 12.x based engine:
+-- the C_* namespaces exist and most legacy globals (GetItemInfo, GetItemCount,
+-- GetContainerItemInfo, GetTradeSkillInfo) are gone. Each capability is resolved
+-- to the modern function first and the legacy one as a fallback, so the addon
+-- also degrades gracefully on other clients. See API_COMPATIBILITY.md.
+local _, ns = ...
+
+local Util = ns.Util
+
+local Compat = {}
+ns.Compat = Compat
+
+local function pick(...)
+  for i = 1, select("#", ...) do
+    local candidate = select(i, ...)
+    if type(candidate) == "function" then
+      return candidate
+    end
+  end
+  return nil
+end
+
+function Compat.Detect()
+  local version, build, buildDate, interface = "unknown", "unknown", "unknown", 0
+  local v, b, d, i = Util.SafeCall(_G.GetBuildInfo)
+  version, build, buildDate, interface = v or version, b or build, d or buildDate, tonumber(i) or 0
+  Compat.client = {
+    version = version,
+    build = build,
+    date = buildDate,
+    interface = interface,
+    projectID = WOW_PROJECT_ID,
+    isForever = interface >= 16000 and interface < 20000,
+  }
+
+  local cItem = type(C_Item) == "table" and C_Item or {}
+  Compat.GetItemInfo = pick(cItem.GetItemInfo, _G.GetItemInfo)
+  Compat.GetItemInfoInstant = pick(cItem.GetItemInfoInstant, _G.GetItemInfoInstant)
+  Compat.GetItemCount = pick(cItem.GetItemCount, _G.GetItemCount)
+  Compat.GetItemIconByID = pick(cItem.GetItemIconByID)
+  Compat.RequestLoadItemDataByID = pick(cItem.RequestLoadItemDataByID)
+  Compat.IsItemDataCachedByID = pick(cItem.IsItemDataCachedByID)
+  Compat.DoesItemExistByID = pick(cItem.DoesItemExistByID)
+
+  local cContainer = type(C_Container) == "table" and C_Container or {}
+  Compat.GetContainerNumSlots = pick(cContainer.GetContainerNumSlots, _G.GetContainerNumSlots)
+  if type(cContainer.GetContainerItemInfo) == "function" then
+    local getInfo = cContainer.GetContainerItemInfo
+    -- Modern API: returns a ContainerItemInfo table.
+    Compat.GetContainerSlot = function(bag, slot)
+      local info = getInfo(bag, slot)
+      if type(info) == "table" and info.itemID then
+        return info.itemID, info.stackCount or 1
+      end
+      return nil
+    end
+  elseif type(_G.GetContainerItemInfo) == "function" then
+    local getInfo = _G.GetContainerItemInfo
+    -- Legacy API: multiple returns, itemID is the 10th value.
+    Compat.GetContainerSlot = function(bag, slot)
+      local _, count, _, _, _, _, _, _, _, itemID = getInfo(bag, slot)
+      if itemID then
+        return itemID, count or 1
+      end
+      return nil
+    end
+  else
+    Compat.GetContainerSlot = nil
+  end
+
+  local cAddOns = type(C_AddOns) == "table" and C_AddOns or {}
+  Compat.GetAddOnMetadata = pick(cAddOns.GetAddOnMetadata, _G.GetAddOnMetadata)
+  Compat.LoadAddOn = pick(cAddOns.LoadAddOn, _G.LoadAddOn)
+
+  -- Merchant window: C_MerchantFrame.GetItemInfo (table) or legacy GetMerchantItemInfo (multiple returns).
+  Compat.GetMerchantNumItems = pick(_G.GetMerchantNumItems)
+  Compat.GetMerchantItemLink = pick(_G.GetMerchantItemLink)
+  local cMerchant = type(C_MerchantFrame) == "table" and C_MerchantFrame or {}
+  if type(cMerchant.GetItemInfo) == "function" then
+    Compat.GetMerchantItem = function(index)
+      local info = cMerchant.GetItemInfo(index)
+      if type(info) ~= "table" then return nil end
+      return { name = info.name, price = info.price, stack = info.stackCount, numAvailable = info.numAvailable,
+        hasExtendedCost = info.hasExtendedCost, isPurchasable = info.isPurchasable }
+    end
+  elseif type(_G.GetMerchantItemInfo) == "function" then
+    Compat.GetMerchantItem = function(index)
+      local name, _, price, stack, numAvailable, isPurchasable, _, extendedCost = _G.GetMerchantItemInfo(index)
+      if name == nil and price == nil then return nil end
+      return { name = name, price = price, stack = stack, numAvailable = numAvailable, hasExtendedCost = extendedCost and true or false, isPurchasable = isPurchasable }
+    end
+  else
+    Compat.GetMerchantItem = nil
+  end
+
+  Compat.InCombatLockdown = pick(_G.InCombatLockdown) or function() return false end
+  -- After(delay, fn) always exists: C_Timer.After, or fn run at once when the
+  -- client has no timer. Code that must not run early (a timeout, a toast's
+  -- hold) checks Compat.hasTimer instead.
+  Compat.hasTimer = type(C_Timer) == "table" and type(C_Timer.After) == "function"
+  Compat.After = Compat.hasTimer and C_Timer.After or function(_, fn) fn() end
+  -- Quest state (attunement steps): C_QuestLog on this engine, legacy globals as fallback.
+  Compat.IsQuestFlaggedCompleted = (type(C_QuestLog) == "table" and type(C_QuestLog.IsQuestFlaggedCompleted) == "function") and C_QuestLog.IsQuestFlaggedCompleted
+    or (type(_G.IsQuestFlaggedCompleted) == "function" and _G.IsQuestFlaggedCompleted) or nil
+  Compat.IsOnQuest = (type(C_QuestLog) == "table" and type(C_QuestLog.IsOnQuest) == "function") and C_QuestLog.IsOnQuest or nil
+
+  Compat.hasTradeSkillUI = type(C_TradeSkillUI) == "table"
+    and type(C_TradeSkillUI.GetRecipeSchematic) == "function"
+    and type(C_TradeSkillUI.GetRecipeInfo) == "function"
+  Compat.hasLegacyTradeSkill = type(_G.GetTradeSkillInfo) == "function"
+  Compat.hasProfessionList = type(_G.GetProfessions) == "function" and type(_G.GetProfessionInfo) == "function"
+  Compat.hasBankTabs = type(C_Bank) == "table"
+    and type(C_Bank.FetchPurchasedBankTabIDs) == "function"
+    and type(Enum) == "table" and type(Enum.BankType) == "table"
+
+  -- Enum values with fallbacks matching the Retail 12.x definitions.
+  local enum = type(Enum) == "table" and Enum or {}
+  Compat.reagentTypeBasic = (enum.CraftingReagentType and enum.CraftingReagentType.Basic) or 1
+  Compat.bankTypeCharacter = (enum.BankType and enum.BankType.Character) or 0
+  Compat.reagentBagIndex = (enum.BagIndex and enum.BagIndex.ReagentBag) or 5
+  Compat.numBagSlots = tonumber(_G.NUM_BAG_SLOTS) or 4
+  Compat.numReagentBagSlots = tonumber(_G.NUM_REAGENTBAG_SLOTS) or 0
+  Compat.hasBackdropTemplate = type(_G.BackdropTemplateMixin) == "table"
+end
+
+-- The value, or nil when it is a secret: the client hides some unit data
+-- from addons (a target's GUID or name in combat, for one). Addon code may
+-- hold a secret but raises an error on comparing or testing it, so anything
+-- read about a unit other than the player goes through here first.
+function Compat.Readable(value)
+  local isSecret = _G.issecretvalue
+  if type(isSecret) == "function" and isSecret(value) then return nil end
+  return value
+end
+
+-- The player's position on the current zone map: uiMapID, x, y (0-1), or nil.
+function Compat.PlayerPosition()
+  local map = _G.C_Map
+  if type(map) ~= "table" or type(map.GetBestMapForUnit) ~= "function" or type(map.GetPlayerMapPosition) ~= "function" then return nil end
+  local mapID = Util.SafeCall(map.GetBestMapForUnit, "player")
+  if type(mapID) ~= "number" then return nil end
+  local pos = Util.SafeCall(map.GetPlayerMapPosition, mapID, "player")
+  if type(pos) ~= "table" then return mapID end
+  local x, y = Util.SafeCall(pos.GetXY, pos)
+  if type(x) ~= "number" or type(y) ~= "number" then return mapID end
+  return mapID, x, y
+end
+
+function Compat.HasWaypoints()
+  local map = _G.C_Map
+  return type(map) == "table" and type(map.SetUserWaypoint) == "function"
+    and type(_G.UiMapPoint) == "table" and type(_G.UiMapPoint.CreateFromCoordinates) == "function"
+end
+
+-- Places the client's user waypoint (the map pin the minimap tracks) at a
+-- map position; x and y are 0-1. Returns ok, reason.
+function Compat.SetWaypoint(mapID, x, y)
+  if not Compat.HasWaypoints() then return false, "This client has no map waypoints." end
+  mapID, x, y = tonumber(mapID), tonumber(x), tonumber(y)
+  if not (mapID and x and y) then return false, "No map position recorded." end
+  local map = _G.C_Map
+  if Util.SafeCall(map.CanSetUserWaypointOnMap, mapID) == false then
+    return false, "The map does not allow waypoints here."
+  end
+  local point = Util.SafeCall(_G.UiMapPoint.CreateFromCoordinates, mapID, x, y)
+  if type(point) ~= "table" then return false, "Could not build the map point." end
+  -- Plain pcall: the client's refusal text is the reason shown to the player.
+  local okSet, err = pcall(map.SetUserWaypoint, point)
+  if not okSet then return false, tostring(err) end
+  local track = _G.C_SuperTrack
+  if type(track) == "table" then
+    Util.SafeCall(track.SetSuperTrackedUserWaypoint, true)
+  end
+  return true
+end
+
+-- Registers an event without letting an unknown event name abort the file.
+-- Forever throws from RegisterEvent for events that do not exist on the client.
+function Compat.RegisterEvent(frame, event)
+  if not frame or type(frame.RegisterEvent) ~= "function" then
+    return false, "no frame"
+  end
+  -- Plain pcall: RegisterEvent returns nothing, so only pcall tells a refusal apart.
+  local ok, err = pcall(frame.RegisterEvent, frame, event)
+  if not ok then
+    ns.Log.Debug("Event %s is not available on this client: %s", tostring(event), tostring(err))
+    return false, err
+  end
+  return true
+end
+
+-- Capability rows { label, value } for /fp status.
+function Compat.Capabilities()
+  local c = Compat.client or {}
+  return {
+    { "Client", string.format("%s (build %s, interface %s)", tostring(c.version), tostring(c.build), tostring(c.interface)) },
+    { "Forever client", c.isForever and "yes" or "no" },
+    { "Item API (C_Item)", Compat.GetItemInfo and "available" or "missing" },
+    { "Container API", Compat.GetContainerSlot and "available" or "missing" },
+    { "Bank tabs (C_Bank)", Compat.hasBankTabs and "available" or "missing" },
+    { "Profession API (C_TradeSkillUI)", Compat.hasTradeSkillUI and "available" or "missing" },
+    { "Legacy tradeskill API", Compat.hasLegacyTradeSkill and "available (unused)" or "missing" },
+    { "Profession list (GetProfessions)", Compat.hasProfessionList and "available" or "missing" },
+    { "Trainer window API", Compat.HasTrainerWindow() and "available" or "missing" },
+  }
+end
+
+-- The trainer window API. Checked at call time: its functions only exist
+-- once the trainer UI has loaded.
+function Compat.HasTrainerWindow()
+  return type(_G.GetNumTrainerServices) == "function" and type(_G.GetTrainerServiceInfo) == "function"
+end
+
+-- Chat link insertion: ChatFrameUtil.InsertLink on this engine, the legacy
+-- ChatEdit_InsertLink otherwise. Resolved at call time (the chat UI loads
+-- after the addon files).
+local function insertLinkTarget()
+  if type(_G.ChatFrameUtil) == "table" and type(_G.ChatFrameUtil.InsertLink) == "function" then return _G.ChatFrameUtil, "InsertLink" end
+  if type(_G.ChatEdit_InsertLink) == "function" then return nil, "ChatEdit_InsertLink" end
+  return nil, nil
+end
+
+-- Puts a link into the open chat box. Returns whether something took it.
+function Compat.InsertLink(link)
+  local owner, name = insertLinkTarget()
+  if not name then return false end
+  local fn = owner and owner[name] or _G[name]
+  return Util.SafeCall(fn, link) and true or false
+end
+
+-- Runs callback(link) after every chat link insertion (Shift-click). Returns
+-- whether a hook was installed.
+function Compat.HookInsertLink(callback)
+  local owner, name = insertLinkTarget()
+  if not name or type(_G.hooksecurefunc) ~= "function" then return false end
+  if owner then _G.hooksecurefunc(owner, name, callback) else _G.hooksecurefunc(name, callback) end
+  return true
+end
+
+-- An item's stats as { [ITEM_MOD_* token] = value }: C_Item.GetItemStats, else
+-- the legacy GetItemStats(link, outTable); nil when neither answers.
+function Compat.GetItemStats(linkOrID)
+  local cItem = type(C_Item) == "table" and C_Item or {}
+  local stats = Util.SafeCall(cItem.GetItemStats, linkOrID)
+  if type(stats) == "table" then return stats end
+  if type(_G.GetItemStats) ~= "function" then return nil end
+  local legacy = {}
+  local result = Util.SafeCall(_G.GetItemStats, linkOrID, legacy)
+  if type(result) == "table" then return result end
+  return next(legacy) and legacy or nil
+end
+
+-- The logged-in character, read at call time. Each returns nil (0 for the
+-- level) while the client API is missing or the unit is not ready.
+
+-- "Alliance" or "Horde".
+function Compat.PlayerFaction()
+  local faction = Util.SafeCall(_G.UnitFactionGroup, "player")
+  return type(faction) == "string" and faction or nil
+end
+
+-- The class token ("SHAMAN"), the numeric class id (7) and the client's
+-- localized class name ("Shaman").
+function Compat.PlayerClass()
+  local className, classFile, classID = Util.SafeCall(_G.UnitClass, "player")
+  classFile = type(classFile) == "string" and classFile ~= "" and string.upper(classFile) or nil
+  return classFile, tonumber(classID), type(className) == "string" and className or nil
+end
+
+function Compat.PlayerLevel()
+  return tonumber((Util.SafeCall(_G.UnitLevel, "player"))) or 0
+end
+
+Compat.Detect()

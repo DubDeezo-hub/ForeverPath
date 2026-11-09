@@ -1,0 +1,239 @@
+-- Completes goals automatically when the item lands in your bags, and
+-- celebrates it (toast, sound, chat line).
+--
+-- Crafting goals count what you gained since the goal was made: the bag and
+-- bank count when the goal was added is stored as target.baseline and the
+-- best gain seen as target.peak, so crafting two bolts and using them straight
+-- away still completes "Craft 2x Bolt". Obtain goals complete when you hold
+-- the quantity. Goals saved before this version get their baseline on the
+-- first check, so an upgrade never completes a goal by itself.
+--
+-- Settings (account): autoComplete, toasts, completeSound.
+local _, ns = ...
+
+local Events = ns.Events
+local Log = ns.Log
+local Util = ns.Util
+local GoalModel = ns.GoalModel
+
+local GoalCompletion = { lastStatus = {} }
+ns.GoalCompletion = GoalCompletion
+
+GoalCompletion.SOUND = 888 -- SOUNDKIT.LEVELUP: the level-up fanfare
+
+local setting = ns.Database.Setting
+
+local function itemGoal(goal)
+  local def = goal and GoalModel.Types[goal.type]
+  return def and def.targetKind == "item" and goal.target and goal.target.itemID ~= nil
+end
+
+-- Records the starting count for a goal (once).
+function GoalCompletion.Baseline(goal, force)
+  if not itemGoal(goal) then return end
+  if force or goal.target.baseline == nil then
+    ns.GoalService.SetProgress(goal.id, { baseline = ns.InventoryProvider.OwnedCount(goal.target.itemID), peak = 0 })
+  end
+end
+
+-- Progress for one goal: { count, gained, peak, needed, done }. A query: the
+-- completion check stores the peak (see itemDone).
+function GoalCompletion.Progress(goal)
+  if not itemGoal(goal) then return nil end
+  local count = ns.InventoryProvider.OwnedCount(goal.target.itemID)
+  local quantity = goal.target.quantity or 1
+  if goal.type == GoalModel.TypeIDs.OBTAIN_ITEM then
+    return { count = count, needed = quantity, done = count >= quantity }
+  end
+  local baseline = goal.target.baseline
+  if baseline == nil then
+    return { count = count, needed = quantity, done = false, unbased = true }
+  end
+  local gained = math.max(0, count - baseline)
+  local peak = math.max(tonumber(goal.target.peak) or 0, gained)
+  return { count = count, gained = gained, peak = peak, needed = quantity, done = peak >= quantity }
+end
+
+-- This character's current skill in a profession, or nil without it.
+function GoalCompletion.SkillLevel(target)
+  local standing = ns.Planner.CurrentSkill(target.professionName, target.professionID)
+  return standing and standing.skillLevel or nil
+end
+
+-- Item goals: a craft goal without a baseline takes one now and is checked
+-- on the next pass; otherwise done once enough items have turned up.
+local function itemDone(goal)
+  if goal.target.baseline == nil and goal.type ~= GoalModel.TypeIDs.OBTAIN_ITEM then
+    GoalCompletion.Baseline(goal)
+    return false
+  end
+  local progress = GoalCompletion.Progress(goal)
+  -- Keep the best gain seen, so items crafted and then used still count.
+  if progress and progress.peak and progress.peak ~= goal.target.peak then
+    ns.GoalService.SetProgress(goal.id, { peak = progress.peak })
+  end
+  return progress ~= nil and progress.done
+end
+
+-- Per goal type: whether the goal is done.
+local DONE_CHECKS = {
+  CRAFT_ITEM = itemDone,
+  OBTAIN_ITEM = itemDone,
+  COMPLETE_ATTUNEMENT = function(goal)
+    local AttuneBridge = ns.AttuneBridge
+    local progress = AttuneBridge.IsAvailable() and AttuneBridge.Progress(goal.target.attuneID) or nil
+    return progress ~= nil and progress.complete == true
+  end,
+  COMPLETE_QUEST = function(goal)
+    local QP = ns.QuestProvider
+    return QP.IsAvailable() and QP.State(goal.target.questID).completed == true
+  end,
+  REACH_REPUTATION = function(goal)
+    local RP = ns.ReputationProvider
+    local progress = RP.IsAvailable() and RP.Progress(goal.target.factionID, goal.target.standing, goal.target.startValue) or nil
+    return progress ~= nil and progress.reached == true
+  end,
+  LEARN_RECIPE = function(goal)
+    return ns.ProfessionProvider.IsLearned(goal.target.spellID) == true
+  end,
+  REACH_SKILL = function(goal)
+    local level = GoalCompletion.SkillLevel(goal.target)
+    return level ~= nil and level >= (goal.target.rank or 0)
+  end,
+  APPLY_ENCHANT = function(goal)
+    return (tonumber(goal.target.casts) or 0) >= (goal.target.quantity or 1)
+  end,
+}
+
+-- Checks every open goal; completes and celebrates the finished ones.
+-- Returns the list of goals completed by this call.
+function GoalCompletion.CompleteFinished(reason)
+  local completed = {}
+  if not setting("autoComplete", true) then return completed end
+  for _, goal in ipairs(ns.GoalService.List({ open = true })) do
+    local check = DONE_CHECKS[goal.type]
+    if check and goal.target and check(goal) and ns.GoalService.SetStatus(goal.id, GoalModel.Statuses.COMPLETED, { completedBy = "auto" }) then
+      completed[#completed + 1] = goal
+      GoalCompletion.Celebrate(goal)
+    end
+  end
+  if #completed > 0 then
+    Log.Debug("Auto-completed %d goal(s) (%s)", #completed, tostring(reason))
+  end
+  return completed
+end
+
+-- A successful cast by the player counts towards every open enchant goal
+-- for that spell. Returns how many goals it touched.
+function GoalCompletion.RecordCast(spellID)
+  spellID = tonumber(spellID)
+  if not spellID then return 0 end
+  local touched = 0
+  for _, goal in ipairs(ns.GoalService.List({ open = true })) do
+    if goal.type == GoalModel.TypeIDs.APPLY_ENCHANT and goal.target and goal.target.spellID == spellID
+      and ns.GoalService.SetCasts(goal.id, (tonumber(goal.target.casts) or 0) + 1) then
+      touched = touched + 1
+    end
+  end
+  if touched > 0 then
+    GoalCompletion.CompleteFinished("cast")
+  end
+  return touched
+end
+
+-- Per goal type: the toast title and the "what was done" line.
+local ANNOUNCEMENTS = {
+  CRAFT_ITEM = { title = "Goal complete", detail = function(name, quantity) return string.format("Crafted %dx %s", quantity, name) end },
+  OBTAIN_ITEM = { title = "Goal complete", detail = function(name, quantity) return string.format("Obtained %dx %s", quantity, name) end },
+  COMPLETE_ATTUNEMENT = { title = "Attunement complete", detail = function(name) return "Attuned: " .. name end },
+  LEARN_RECIPE = { title = "Recipe learned", detail = function(name) return "Learned: " .. name end },
+  REACH_SKILL = { title = "Skill reached", detail = function(name) return name .. " reached" end },
+  COMPLETE_QUEST = { title = "Quest complete", detail = function(name) return "Quest done: " .. name end },
+  REACH_REPUTATION = { title = "Reputation reached", detail = function(name) return name .. " reached" end },
+  APPLY_ENCHANT = { title = "Enchant applied", detail = function(name, quantity) return string.format("Cast %dx %s", quantity, name) end },
+}
+
+-- Chat line + sound, and FP_GOAL_COMPLETED(goal, toast) for the UI's toast
+-- (when settings.toasts is on).
+function GoalCompletion.Celebrate(goal)
+  local name = ns.GoalService.Name(goal)
+  local quantity = goal.target and goal.target.quantity or 1
+  local doneCount = ns.GoalService.Count({ status = GoalModel.Statuses.COMPLETED })
+  local announce = ANNOUNCEMENTS[goal.type]
+  local detail = announce and announce.detail(name, quantity) or name
+  Log.Print("Goal complete: %s. %d goal%s done.", detail, doneCount, doneCount == 1 and "" or "s")
+  if setting("completeSound", true) and type(PlaySound) == "function" then
+    local kit = (type(SOUNDKIT) == "table" and SOUNDKIT.LEVELUP) or GoalCompletion.SOUND
+    Util.SafeCall(PlaySound, kit, "Master")
+  end
+  if setting("toasts", true) then
+    local item = goal.target.itemID and ns.ItemProvider.GetItem(goal.target.itemID) or { icon = goal.target.icon, quality = 1 }
+    Events.Fire("FP_GOAL_COMPLETED", goal, {
+      title = announce and announce.title or "Goal complete",
+      name = name,
+      quality = item.quality,
+      icon = item.icon,
+      detail = detail,
+      sub = string.format("%d goal%s done", doneCount, doneCount == 1 and "" or "s"),
+      goalID = goal.id,
+    })
+  end
+end
+
+function GoalCompletion.Init()
+  Events.On("FP_GOALS_CHANGED", function(event, goal)
+    if not goal then return end
+    if event == "added" then
+      GoalCompletion.Baseline(goal, true)
+    elseif event == "updated" and itemGoal(goal) then
+      local last = GoalCompletion.lastStatus[goal.id]
+      if last == GoalModel.Statuses.COMPLETED and GoalModel.IsOpen(goal) then
+        -- Reopened: start counting again from what is in the bags now.
+        GoalCompletion.Baseline(goal, true)
+      end
+    end
+    GoalCompletion.lastStatus[goal.id] = goal.status
+  end)
+  Events.On("FP_INVENTORY_UPDATED", function()
+    GoalCompletion.CompleteFinished("inventory")
+  end)
+  -- Recipes learned and skill-ups complete learn-recipe and reach-skill goals.
+  Events.On("FP_RECIPES_UPDATED", function()
+    Events.Debounce("recipe-goal-check", 0.5, function() GoalCompletion.CompleteFinished("recipes") end)
+  end)
+  Events.RegisterWoW("SKILL_LINES_CHANGED", function()
+    Events.Debounce("skill-goal-check", 1, function()
+      GoalCompletion.CompleteFinished("skill")
+      Events.Fire("FP_PLAYER_CHANGED", "skill")
+    end)
+  end)
+  Events.RegisterWoW("UPDATE_FACTION", function()
+    Events.Debounce("reputation-goal-check", 1, function()
+      GoalCompletion.CompleteFinished("reputation")
+    end)
+  end)
+  -- Enchant goals count the player's own successful casts of the spell.
+  Events.RegisterWoW("UNIT_SPELLCAST_SUCCEEDED", function(unit, _, spellID)
+    if unit == "player" then
+      GoalCompletion.RecordCast(ns.Compat.Readable(spellID))
+    end
+  end)
+  -- Attunement steps and quest goals move on quests and levels.
+  for _, event in ipairs({ "QUEST_TURNED_IN", "QUEST_LOG_UPDATE", "PLAYER_LEVEL_UP", "QUEST_ACCEPTED" }) do
+    Events.RegisterWoW(event, function()
+      Events.Debounce("attunement-check", 1, function()
+        GoalCompletion.CompleteFinished("quest")
+        Events.Fire("FP_PLAYER_CHANGED", "quest")
+      end)
+    end)
+  end
+  Events.RegisterWoW("PLAYER_ENTERING_WORLD", function()
+    -- Remember statuses so a later reopen is noticed, and baseline craft
+    -- goals saved without one, so the first check can already complete them.
+    for _, goal in ipairs(ns.GoalService.List()) do
+      GoalCompletion.lastStatus[goal.id] = goal.status
+      if goal.type == GoalModel.TypeIDs.CRAFT_ITEM then GoalCompletion.Baseline(goal) end
+    end
+    ns.Compat.After(3, function() GoalCompletion.CompleteFinished("login") end)
+  end)
+end

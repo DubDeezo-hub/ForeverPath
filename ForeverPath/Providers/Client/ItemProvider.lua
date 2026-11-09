@@ -1,0 +1,300 @@
+-- Item resolution: parses player input and wraps C_Item with async loading.
+--
+-- Item data on modern clients is loaded lazily from the server. GetItemInfo
+-- returns nil until the item is cached; RequestLoadItemDataByID triggers the
+-- fetch and ITEM_DATA_LOAD_RESULT reports completion. Names seen once are kept
+-- in ForeverPathDB.itemNames so goals stay readable and name search works
+-- without a full item database (which the client does not expose).
+local _, ns = ...
+
+local Compat = ns.Compat
+local Util = ns.Util
+local Log = ns.Log
+local Events = ns.Events
+
+local ItemProvider = {
+  pending = {},   -- itemID -> true while a load request is outstanding
+  failed = {},    -- itemID -> true when the server reported no data this session
+}
+ns.ItemProvider = ItemProvider
+
+-- Parses an item ID, an item link, "item:1234", or a free-text name.
+-- Pure function. Returns nil for empty or invalid input.
+function ItemProvider.ParseInput(text)
+  if type(text) == "number" then
+    if Util.IsPositiveInt(text) then
+      return { kind = "id", itemID = text }
+    end
+    return nil
+  end
+  if type(text) ~= "string" then
+    return nil
+  end
+  local s = Util.Trim(text)
+  if s == "" then
+    return nil
+  end
+  local linkID = s:match("|Hitem:(%d+)")
+  if linkID then
+    local name = s:match("|h%[(.-)%]|h")
+    return { kind = "link", itemID = tonumber(linkID), name = name, link = s }
+  end
+  local prefixed = s:match("^[Ii][Tt][Ee][Mm]:(%d+)$")
+  if prefixed then
+    return { kind = "id", itemID = tonumber(prefixed) }
+  end
+  local id = Util.ParseInt(s)
+  if id then
+    if id > 0 then
+      return { kind = "id", itemID = id }
+    end
+    return nil
+  end
+  return { kind = "name", name = s }
+end
+
+local function nameCache()
+  return ns.Database.IsLoaded() and ns.db.itemNames or nil
+end
+
+function ItemProvider.RememberName(itemID, name)
+  local cache = nameCache()
+  if cache and type(name) == "string" and name ~= "" then
+    cache[itemID] = name
+  end
+end
+
+-- A name seen on this client, else the catalogue's (the client's own item
+-- table at extraction time), else nil.
+function ItemProvider.GetCachedName(itemID)
+  local cache = nameCache()
+  local name = cache and cache[itemID] or nil
+  if name then return name end
+  return ns.Recipes.ItemName(itemID)
+end
+
+-- true / false, or nil when the client cannot say.
+function ItemProvider.Exists(itemID)
+  if not Util.IsPositiveInt(itemID) then
+    return false
+  end
+  if Compat.DoesItemExistByID then
+    local ok, exists = pcall(Compat.DoesItemExistByID, itemID)
+    if ok and exists ~= nil then
+      return exists and true or false
+    end
+  end
+  if Compat.GetItemInfoInstant then
+    local ok, id = pcall(Compat.GetItemInfoInstant, itemID)
+    if ok then
+      return id ~= nil
+    end
+  end
+  return nil
+end
+
+function ItemProvider.RequestLoad(itemID)
+  if ItemProvider.pending[itemID] or ItemProvider.failed[itemID] then
+    return false
+  end
+  if not Compat.RequestLoadItemDataByID then
+    return false
+  end
+  ItemProvider.pending[itemID] = true
+  local ok, err = pcall(Compat.RequestLoadItemDataByID, itemID)
+  if not ok then
+    ItemProvider.pending[itemID] = nil
+    Log.Debug("RequestLoadItemDataByID(%s) failed: %s", tostring(itemID), tostring(err))
+    return false
+  end
+  return true
+end
+
+-- How the client says an item binds: 1 on pickup, 2 on equip, 3 on use,
+-- 4 quest item; nil while the item is not loaded or the API is missing.
+function ItemProvider.BindType(itemID)
+  local name, _, _, _, _, _, _, _, _, _, _, _, _, bind = Util.SafeCall(Compat.GetItemInfo, itemID)
+  return name and tonumber(bind) or nil
+end
+
+-- Returns { itemID, exists, loaded, name, link, icon, quality, unavailable }.
+-- Never blocks: when data is missing it requests a load and the caller
+-- refreshes on FP_ITEM_LOADED.
+function ItemProvider.GetItem(itemID)
+  local info = { itemID = itemID, exists = nil, loaded = false }
+  if not Util.IsPositiveInt(itemID) then
+    info.exists = false
+    return info
+  end
+  info.exists = ItemProvider.Exists(itemID)
+  if info.exists == false then
+    return info
+  end
+  if Compat.GetItemInfoInstant then
+    info.icon = select(5, Util.SafeCall(Compat.GetItemInfoInstant, itemID))
+  end
+  if Compat.GetItemInfo then
+    local name, link, quality, _, _, _, _, _, _, texture = Util.SafeCall(Compat.GetItemInfo, itemID)
+    if name then
+      info.loaded = true
+      info.name = name
+      info.link = link
+      info.quality = quality
+      info.icon = info.icon or texture
+      ItemProvider.RememberName(itemID, name)
+      return info
+    end
+  end
+  info.name = ItemProvider.GetCachedName(itemID)
+  info.quality = ns.Recipes.ItemQuality(itemID)
+  if ItemProvider.failed[itemID] then
+    info.unavailable = true
+  else
+    ItemProvider.RequestLoad(itemID)
+  end
+  return info
+end
+
+-- Display name with a readable fallback.
+function ItemProvider.GetName(itemID)
+  local info = ItemProvider.GetItem(itemID)
+  return info.name or ("Item " .. tostring(itemID))
+end
+
+-- Warms the name cache without forcing a UI refresh.
+function ItemProvider.Prefetch(itemID)
+  if not Util.IsPositiveInt(itemID) or ItemProvider.GetCachedName(itemID) then
+    return
+  end
+  ItemProvider.GetItem(itemID)
+end
+
+-- Extra places item names come from (other addons' data): each entry is a
+-- function returning { [itemID] = name } (cached by its owner).
+ItemProvider.nameSources = {}
+
+function ItemProvider.RegisterNameSource(fn)
+  if type(fn) == "function" then ItemProvider.nameSources[#ItemProvider.nameSources + 1] = fn end
+end
+
+-- Name search over cached names, scanned recipe names, the catalogue and
+-- every registered name source. Exact matches first, then names starting
+-- with the text, then names with a word starting with it, then any other
+-- substring; each group by name. When the list is cut to `limit`, two
+-- slots are kept for the later groups so "Storm..." never hides "Mace of
+-- the Storms".
+ItemProvider.RESERVED_SLOTS = 2
+
+function ItemProvider.SearchByName(query, limit)
+  limit = limit or 10
+  local results = {}
+  local needle = Util.Trim(query):lower()
+  if needle == "" then
+    return results
+  end
+  local seen = {}
+  local buckets = { [0] = {}, [1] = {}, [2] = {}, [3] = {} }
+  local function consider(itemID, name)
+    if seen[itemID] or type(name) ~= "string" then
+      return
+    end
+    local rank = Util.MatchRank(name, needle)
+    if rank then
+      seen[itemID] = true
+      local bucket = buckets[rank]
+      bucket[#bucket + 1] = { itemID = itemID, name = name, rank = rank }
+    end
+  end
+  local cache = nameCache()
+  if cache then
+    for itemID, name in pairs(cache) do
+      consider(itemID, name)
+    end
+  end
+  if ns.Database.IsLoaded() then
+    for _, recipe in pairs(ns.db.recipes) do
+      if recipe.outputItemID then
+        consider(recipe.outputItemID, recipe.name)
+      end
+    end
+  end
+  -- The catalogue names every item a recipe makes or needs; the item index
+  -- every item the client lists as searchable.
+  for itemID, row in pairs(ns.Recipes.Items()) do
+    consider(itemID, row[1])
+  end
+  local index = ns.Data.ItemIndex
+  if type(index) == "table" then
+    for itemID, row in pairs(index) do
+      consider(itemID, row[1])
+    end
+  end
+  for _, source in ipairs(ItemProvider.nameSources) do
+    local names = Log.Try(source)
+    if type(names) == "table" then
+      for itemID, name in pairs(names) do
+        consider(itemID, name)
+      end
+    end
+  end
+  -- Same name (a crafted and a quest version of one item): the lower id first.
+  local function byName(a, b)
+    if a.name ~= b.name then return a.name < b.name end
+    return a.itemID < b.itemID
+  end
+  local ordered, later = {}, {}
+  for rank = 0, 3 do
+    table.sort(buckets[rank], byName)
+    for _, hit in ipairs(buckets[rank]) do
+      ordered[#ordered + 1] = hit
+      if rank >= 2 then later[#later + 1] = hit end
+    end
+  end
+  if #ordered <= limit then
+    return ordered
+  end
+  -- Keep room for word-start and substring matches the earlier groups would push out.
+  local reserve = 0
+  local firstLater = 0
+  for index, hit in ipairs(ordered) do
+    if hit.rank >= 2 then firstLater = index break end
+  end
+  if firstLater > 0 and firstLater > limit - ItemProvider.RESERVED_SLOTS then
+    -- Never reserve the first slot: the best match always comes first.
+    reserve = math.min(ItemProvider.RESERVED_SLOTS, #later, math.max(0, limit - 1))
+  end
+  for index = 1, limit - reserve do
+    results[#results + 1] = ordered[index]
+  end
+  local included = {}
+  for _, hit in ipairs(results) do included[hit.itemID] = true end
+  for _, hit in ipairs(later) do
+    if #results >= limit then break end
+    if not included[hit.itemID] then
+      results[#results + 1] = hit
+      included[hit.itemID] = true
+    end
+  end
+  return results
+end
+
+function ItemProvider.OnItemDataLoadResult(itemID, success)
+  if not ItemProvider.pending[itemID] then
+    return
+  end
+  ItemProvider.pending[itemID] = nil
+  if success == false then
+    ItemProvider.failed[itemID] = true
+  elseif Compat.GetItemInfo then
+    local name = Util.SafeCall(Compat.GetItemInfo, itemID)
+    if name then
+      ItemProvider.RememberName(itemID, name)
+    end
+  end
+  Events.Fire("FP_ITEM_LOADED", itemID, success ~= false)
+end
+
+function ItemProvider.Init()
+  Events.RegisterWoW("ITEM_DATA_LOAD_RESULT", ItemProvider.OnItemDataLoadResult)
+  Events.RegisterWoW("GET_ITEM_INFO_RECEIVED", ItemProvider.OnItemDataLoadResult)
+end

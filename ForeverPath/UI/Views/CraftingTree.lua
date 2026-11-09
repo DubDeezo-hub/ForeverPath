@@ -1,0 +1,772 @@
+-- Screen 03: recursive dependency tree (the "Dependency Tree" tab of the
+-- Crafting screen). A sub-view, not a registered screen: Crafting embeds it. Renders Planner views (view.tree) and lets the player pick
+-- a route per reagent. No calculations happen here.
+local _, ns = ...
+local Routes = ns.DependencyResolver.Routes
+local Steps = ns.DependencyResolver.Steps
+
+local Theme = ns.UI.Theme
+local Widgets = ns.UI.Widgets
+local C = Theme.Colors
+local R = ns.DependencyResolver
+
+local CraftingTree = {}
+ns.UI.CraftingTree = CraftingTree
+
+local ROW = 38
+local GUIDE = 18
+local SIDE = 252
+local COLS = { have = 44, status = 70, via = 104, cost = 62 }
+local MAX_OPTIONS = 3
+local CARD_WIDTH = SIDE - 24 -- the side panel less its 12 px insets
+
+local COVERAGE_BADGE = { have = { "Have", "ok" }, partial = { "Partial", "partial" }, missing = { "Missing", "missing" } }
+
+local function nameOf(itemID)
+  return ns.ItemProvider.GetName(itemID)
+end
+
+-- "Craft - Tailoring", "AH", "In bags" ... for the Get via column.
+-- The root of a crafting tree is the thing being made: it never claims
+-- inventory and always crafts. The root of an obtain tree behaves like any
+-- other node (it is the item the player needs to get).
+local function isCraftRoot(node)
+  return node.depth == 0 and not node.claims and not node.step
+end
+
+-- A node that is only ever crafted: the goal item of a crafting tree, or a
+-- craft done for skill points. No inventory, no routes, children are reagents.
+local function isCraftOnly(node)
+  return isCraftRoot(node) or node.forSkill ~= nil
+end
+
+local function isSkillRoot(node)
+  return node.step ~= nil and node.step.kind == Steps.SKILL
+end
+
+local function isQuestRoot(node)
+  return node.step ~= nil and node.step.kind == Steps.QUEST
+end
+
+local STEP_ICON = "Interface\\Icons\\INV_Misc_Book_09"
+local SKILL_ICON = "Interface\\Icons\\INV_Misc_Note_01"
+local ENCHANT_ICON = "Interface\\Icons\\INV_Enchant_Disenchant"
+
+-- Name, icon and quality for a row: an item, a step such as "train this
+-- recipe", or an enchant (which has no item).
+local function displayOf(node)
+  if node.step then
+    return { name = node.step.name, icon = node.step.icon or (isSkillRoot(node) and SKILL_ICON or STEP_ICON), quality = 1, loaded = true }
+  end
+  if not node.itemID then
+    return { name = node.name, icon = node.icon or ENCHANT_ICON, quality = 1, loaded = true }
+  end
+  return ns.ItemProvider.GetItem(node.itemID)
+end
+
+-- Display name of any node (items by id, enchants and steps by name).
+local function labelOf(node)
+  if not node then return "?" end
+  if node.itemID then return nameOf(node.itemID) end
+  return node.name or (node.step and node.step.name) or "?"
+end
+
+local function stepVia(step)
+  if step.kind == Steps.QUEST then return "Quest" end
+  return ns.DependencyResolver.TrainLabel(step)
+end
+
+local function viaText(node)
+  if isSkillRoot(node) then return "Craft for skill" end
+  if node.step then return stepVia(node.step) end
+  if node.forSkill then
+    local text = node.craft and node.craft.professionName and ("Craft - " .. node.craft.professionName) or "Craft"
+    if node.craft and not node.craft.learned then text = text .. " (learn first)" end
+    return text
+  end
+  if isCraftRoot(node) then
+    local text = node.craft and node.craft.professionName and ((node.enchant and "Cast - " or "Craft - ") .. node.craft.professionName) or (node.enchant and "Cast" or "Craft")
+    if node.craft and not node.craft.learned then text = text .. " (learn first)" end
+    return text
+  end
+  if node.missing <= 0 then
+    if (node.ownedAlts or 0) > 0 then
+      local alt = node.altSources and node.altSources[1]
+      return alt and ("Alt: " .. alt.name) or "Alts"
+    end
+    if (node.ownedBank or 0) > 0 and (node.ownedBags or 0) == 0 then return "Bank" end
+    if (node.ownedBank or 0) > 0 then return "Bags + bank" end
+    return "In bags"
+  end
+  if node.route == Routes.ALT and node.hint then
+    return "Alt: " .. (node.hint.name or "?")
+  end
+  if node.route == Routes.ALTCRAFT and node.hint then
+    return "Craft on " .. (node.hint.name or "alt")
+  end
+  if node.route == Routes.CRAFT and node.craft then
+    local craft = node.craft
+    local text
+    if craft.combine then
+      text = "Combine"
+    else
+      text = craft.professionName and ("Craft - " .. craft.professionName) or "Craft"
+      if craft.unavailable then
+        text = text .. " (" .. craft.unavailable .. ")"
+      elseif not craft.learned and craft.crafter then
+        text = text .. (craft.crafter.isCurrent and " (learn" or (" (" .. craft.crafter.name)) .. (craft.teachItemID and ", needs plans)" or ")")
+      elseif not craft.learned then
+        text = text .. " (not learned)"
+      end
+    end
+    if node.blocked == "depth" then text = text .. " (depth limit)" end
+    return text
+  end
+  if node.noRoute then return "No route (soulbound)" end
+  if node.route == Routes.BUY then
+    if node.blocked == "cycle" then return "AH (recipe loops)" end
+    if node.craftOption and not node.craftOption.learned then return "AH, or learn recipe" end
+    if node.craftOption then return "AH (craft available)" end
+    return "AH"
+  end
+  return R.RouteLabels[node.route] or "Obtain"
+end
+
+local function noteText(node)
+  if isSkillRoot(node) then
+    return string.format("%d craft%s over %d recipe%s", node.quantity, node.quantity == 1 and "" or "s", #node.children, #node.children == 1 and "" or "s")
+  end
+  if node.forSkill then
+    return string.format("%d craft%s - skill %d to %d", node.craft and node.craft.crafts or 0, node.craft and node.craft.crafts == 1 and "" or "s", node.forSkill.from or 0, node.forSkill.to or 0)
+  end
+  if isQuestRoot(node) then
+    return #node.children > 0 and string.format("%d item%s to bring", #node.children, #node.children == 1 and "" or "s") or "no items to bring"
+  end
+  if node.step then
+    if node.step.rank and node.step.rank > 1 then
+      return string.format("needs %s %d", node.step.professionName or "skill", node.step.rank)
+    end
+    return node.step.trainer and node.step.trainer.name and "learn from trainer" or "trainer requirement not recorded yet"
+  end
+  if isCraftRoot(node) then
+    local unit = node.enchant and "cast" or "craft"
+    return string.format("%d %s%s", node.craft and node.craft.crafts or 0, unit, node.craft and node.craft.crafts == 1 and "" or "s")
+  end
+  local parts = {}
+  if node.craft and node.missing > 0 then
+    parts[#parts + 1] = string.format("%d craft%s", node.craft.crafts, node.craft.crafts == 1 and "" or "s")
+    if node.craft.surplus > 0 then parts[#parts + 1] = string.format("+%d spare", node.craft.surplus) end
+  elseif node.missing > 0 then
+    parts[#parts + 1] = string.format("%d missing", node.missing)
+  else
+    parts[#parts + 1] = "on hand"
+  end
+  if (node.reserved or 0) > 0 then
+    parts[#parts + 1] = string.format("%d reserved by earlier goals", node.reserved)
+  end
+  return table.concat(parts, " - ")
+end
+
+---------------------------------------------------------------------------
+-- Rows
+---------------------------------------------------------------------------
+local function createRow(content, index, tree)
+  local row = Widgets.Frame(content, nil, { frameType = "Button", bg = C.raised, border = C.bronzeDim, alpha = 0, borderAlpha = 0 })
+  Widgets.StackAt(row, content, (index - 1) * ROW, ROW)
+  local line = Widgets.HLine(row, C.black, 0.45)
+  line:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 0, 0)
+  line:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0, 0)
+  Widgets.HoverFill(row, C.white, 0.03)
+
+  row.guides = {}
+  row.elbow = Widgets.Texture(row, C.guide, 1, "ARTWORK")
+  row.elbow:SetHeight(1)
+  row.stem = Widgets.Texture(row, C.guide, 1, "ARTWORK")
+  row.stem:SetWidth(1)
+
+  local chevron = CreateFrame("Button", nil, row)
+  chevron:SetSize(16, 16)
+  chevron.arrow = Widgets.Arrow(chevron, 8, "down", C.text2)
+  chevron.arrow:SetPoint("CENTER", chevron, "CENTER", 0, 0)
+  chevron:SetScript("OnClick", function()
+    if row.node then tree:ToggleNode(row.node.key) end
+  end)
+  row.chevron = chevron
+
+  row.icon = Widgets.ItemIcon(row, 28)
+  row.name = Widgets.Text(row, "body", "")
+  row.qty = Widgets.Text(row, "secondary", "")
+  row.note = Widgets.Text(row, "note", "")
+
+  row.cost = Widgets.Text(row, "secondaryBright", "", { justify = "RIGHT", width = COLS.cost })
+  row.cost:SetPoint("RIGHT", row, "RIGHT", -10, 0)
+  row.via = Widgets.Text(row, "secondary", "", { width = COLS.via })
+  row.via:SetPoint("RIGHT", row.cost, "LEFT", -10, 0)
+  local statusFrame = CreateFrame("Frame", nil, row)
+  statusFrame:SetSize(COLS.status, ROW)
+  statusFrame:SetPoint("RIGHT", row.via, "LEFT", -10, 0)
+  row.badge = Widgets.Badge(statusFrame, "", "ok")
+  row.badge:SetPoint("LEFT", statusFrame, "LEFT", 0, 0)
+  row.have = Widgets.Text(row, "number", "", { justify = "RIGHT", width = COLS.have })
+  row.have:SetPoint("RIGHT", statusFrame, "LEFT", -10, 0)
+  row.name:SetPoint("RIGHT", row.have, "LEFT", -10, 0)
+  row.note:SetPoint("RIGHT", row.have, "LEFT", -10, 0)
+
+  row:SetScript("OnClick", function()
+    if row.node then tree:SelectNode(row.node.key) end
+  end)
+  Widgets.ShiftClickLinks(row, function(self) return self.node and self.node.itemID end)
+  Widgets.SetItemTooltip(row, function(self) return self.node and self.node.itemID end, function(self)
+    local node = self.node
+    if not node or isCraftOnly(node) or node.step then return nil end
+    local lines = {
+      node.depth == 0 and string.format("Needed: %d (goal target)", node.quantity)
+        or string.format("Needed: %d (%d per craft of %s)", node.quantity, node.perCraft or 0, labelOf(tree.byKey and tree.byKey[node.parentKey] or nil)),
+      string.format("Free for this goal: %d (bags %d%s)", node.available or 0, node.availableBags or 0, node.availableBank and (", bank " .. node.availableBank) or ""),
+    }
+    if (node.reserved or 0) > 0 then lines[#lines + 1] = string.format("Reserved by higher-priority goals: %d", node.reserved) end
+    if node.craftOption then
+      lines[#lines + 1] = string.format("Recipe: %s (%s)%s", node.craftOption.recipe.name or "?", node.craftOption.professionName or "?", node.craftOption.learned and "" or " - not learned")
+    end
+    local price = node.itemID and ns.PriceProvider.GetPrice(node.itemID)
+    lines[#lines + 1] = price and ("Price: " .. Widgets.Money(price.copper, true) .. " each") or "Price: no data"
+    return lines
+  end)
+
+  -- Lays out guide lines, chevron, icon and name for the node's depth.
+  function row:Layout(entry)
+    local node = entry.node
+    local depth = node.depth
+    local x = 8
+    for i = 1, #self.guides do self.guides[i]:Hide() end
+    -- Vertical lines for ancestors that continue below this row.
+    for level = 1, depth - 1 do
+      if entry.guides[level] then
+        local guide = self.guides[level]
+        if not guide then
+          guide = Widgets.Texture(self, C.guide, 1, "ARTWORK")
+          guide:SetWidth(1)
+          self.guides[level] = guide
+        end
+        guide:ClearAllPoints()
+        guide:SetPoint("TOP", self, "TOPLEFT", x + (level - 1) * GUIDE + 8, 0)
+        guide:SetPoint("BOTTOM", self, "BOTTOMLEFT", x + (level - 1) * GUIDE + 8, 0)
+        guide:Show()
+      end
+    end
+    if depth > 0 then
+      local gx = x + (depth - 1) * GUIDE + 8
+      self.stem:ClearAllPoints()
+      self.stem:SetPoint("TOP", self, "TOPLEFT", gx, 0)
+      if entry.isLast then
+        self.stem:SetPoint("BOTTOM", self, "TOPLEFT", gx, -ROW / 2)
+      else
+        self.stem:SetPoint("BOTTOM", self, "BOTTOMLEFT", gx, 0)
+      end
+      self.stem:Show()
+      self.elbow:ClearAllPoints()
+      self.elbow:SetPoint("LEFT", self, "TOPLEFT", gx, -ROW / 2)
+      self.elbow:SetWidth(GUIDE - 6)
+      self.elbow:Show()
+    else
+      self.stem:Hide()
+      self.elbow:Hide()
+    end
+    local left = x + depth * GUIDE + (depth > 0 and 6 or 0)
+    self.chevron:ClearAllPoints()
+    self.chevron:SetPoint("LEFT", self, "LEFT", left, 0)
+    if entry.hasChildren then
+      self.chevron:Show()
+      if self.chevron.arrow.SetRotation then
+        self.chevron.arrow:SetRotation(entry.collapsed and 0 or -math.pi / 2)
+      end
+    else
+      self.chevron:Hide()
+    end
+    local size = depth == 0 and 28 or 24
+    self.icon:SetSize(size, size)
+    self.icon:ClearAllPoints()
+    self.icon:SetPoint("LEFT", self, "LEFT", left + 18, 0)
+    self.name:ClearAllPoints()
+    self.name:SetPoint("TOPLEFT", self.icon, "TOPRIGHT", 8, -1)
+    self.name:SetPoint("RIGHT", self.have, "LEFT", -10, 0)
+    self.note:ClearAllPoints()
+    self.note:SetPoint("BOTTOMLEFT", self.icon, "BOTTOMRIGHT", 8, 1)
+    self.note:SetPoint("RIGHT", self.have, "LEFT", -10, 0)
+  end
+
+  function row:SetSelected(selected)
+    Widgets.SetBackdrop(self, C.raised, C.bronzeDim, selected and 1 or 0, selected and 1 or 0)
+  end
+  return row
+end
+
+---------------------------------------------------------------------------
+-- Selected node panel
+---------------------------------------------------------------------------
+local function createOptionCard(parent, index, tree)
+  local card = Widgets.Frame(parent, nil, { frameType = "Button", bg = C.sidebar, border = C.line })
+  card:SetHeight(38)
+  local highlight = card:CreateTexture(nil, "HIGHLIGHT")
+  highlight:SetAllPoints(card)
+  Widgets.SetColor(highlight, C.white, 0.03)
+  -- Title and detail wrap: the card grows to fit them, nothing is cut off.
+  card.title = Widgets.Text(card, "body", "", { wrap = true })
+  card.title:SetPoint("TOPLEFT", card, "TOPLEFT", 10, -5)
+  card.detail = Widgets.Text(card, "small", "", { wrap = true })
+  card.detail:SetPoint("TOPLEFT", card.title, "BOTTOMLEFT", 0, -2)
+  card.cost = Widgets.Text(card, "secondary", "", { justify = "RIGHT", color = C.text3 })
+  card.cost:SetPoint("TOPRIGHT", card, "TOPRIGHT", -10, -5)
+  card.best = Widgets.Badge(card, "Best", "gold")
+  card.best:SetPoint("TOPRIGHT", card, "TOPRIGHT", -6, 6)
+  card:SetScript("OnClick", function(self)
+    if self.option and self.node then tree:ApplyRoute(self.node, self.option) end
+  end)
+
+  -- Explicit widths so the wrapped heights are known straight after SetText.
+  function card:Fit()
+    local inner = CARD_WIDTH - 20
+    local costWidth = self.cost:GetText() ~= "" and math.ceil(self.cost:GetStringWidth() or 0) + 6 or 0
+    self.title:SetWidth(math.max(60, inner - costWidth))
+    self.detail:SetWidth(inner)
+    local titleHeight = math.max(12, math.ceil(self.title:GetStringHeight() or 0))
+    local detailHeight = self.detail:GetText() ~= "" and math.ceil(self.detail:GetStringHeight() or 0) or 0
+    self:SetHeight(math.max(38, 5 + titleHeight + 2 + detailHeight + 6))
+  end
+  return card
+end
+
+-- The side panel header for a node: { sub, count, missing, missingColor,
+-- barKind, barValue, ways } (ways: the label above the option cards).
+local function nodeHeader(node)
+  local resolved = node.childrenResolved and 1 or 0
+  if isSkillRoot(node) then
+    return { sub = string.format("%d craft%s over %d recipe%s", node.quantity, node.quantity == 1 and "" or "s", #node.children, #node.children == 1 and "" or "s"),
+      count = string.format("%d|r %s crafts", node.quantity, Theme.Hex.text3), missing = "", barKind = "gold", barValue = resolved, ways = "Recipes" }
+  elseif node.forSkill then
+    return { sub = string.format("Skill %d to %d - %s", node.forSkill.from or 0, node.forSkill.to or 0, viaText(node)),
+      count = string.format("%d|r %s crafts", node.craft and node.craft.crafts or 0, Theme.Hex.text3),
+      missing = node.craft and not node.craft.learned and "not learned" or "", barKind = "gold", barValue = resolved, ways = "Reagents" }
+  elseif isQuestRoot(node) then
+    return { sub = "Quest - the items below are what its chain asks you to bring",
+      count = string.format("%d|r %s items", #node.children, Theme.Hex.text3), missing = "", barKind = "gold", barValue = resolved, ways = "Quest items" }
+  elseif node.step then
+    local trainer = node.step.trainer
+    return {
+      sub = trainer and trainer.name
+        and string.format("Train at %s%s%s", trainer.name, trainer.zone and (" - " .. trainer.zone) or "", trainer.subzone and (" (" .. trainer.subzone .. ")") or "")
+        or string.format("Train at any %s trainer (requirement recorded on your next visit)", node.step.professionName or "profession"),
+      count = string.format("%d|r %s/ %d", 0, Theme.Hex.text3, 1),
+      missing = node.step.rank and node.step.rank > 1 and string.format("needs %s %d", node.step.professionName or "skill", node.step.rank) or "1 step",
+      barKind = "gold", barValue = 0,
+      ways = trainer and trainer.cost and trainer.cost > 0 and ("Training cost: " .. Widgets.Money(trainer.cost, true)) or "Training",
+    }
+  elseif isCraftRoot(node) then
+    local unit = node.enchant and "cast" or "craft"
+    return { sub = string.format("Goal target - %d %s%s", node.craft and node.craft.crafts or 0, unit, node.craft and node.craft.crafts == 1 and "" or "s"),
+      count = string.format("%d|r %s/ %d", 0, Theme.Hex.text3, node.quantity), missing = string.format("%d to %s", node.quantity, unit),
+      barKind = "gold", barValue = resolved, ways = "Reagents" }
+  end
+  return {
+    sub = node.depth == 0 and ("Goal item - " .. viaText(node)) or string.format("Depth %d - %s", node.depth, viaText(node)),
+    count = string.format("%s%d|r %s/ %d", Theme.Hex[node.missing > 0 and (node.owned > 0 and "partial" or "missing") or "ok"], node.available or 0, Theme.Hex.text3, node.quantity),
+    missing = node.missing > 0 and string.format("%d missing", node.missing) or "complete",
+    missingColor = node.missing > 0 and C.missing or C.ok,
+    barKind = node.missing > 0 and "gold" or "ok",
+    barValue = node.quantity > 0 and math.min(1, (node.owned or 0) / node.quantity) or 1,
+    ways = node.missing > 0 and string.format("Ways to get %d more", node.missing) or "Ways to get it",
+  }
+end
+
+-- What a craft option still needs before it can be used, as a prefix.
+local function craftState(option, node)
+  if node.raw then return "Gathering material: refining the tier below is off by default - " end
+  if option.combine then return "Anyone can - " end
+  if option.learned then return "" end
+  if option.unavailable then return "Recipe not learned: " .. (option.reason or "no crafter") .. " - " end
+  if option.crafter then
+    return (option.crafter.isCurrent and "You can learn it" or (option.crafter.name .. " can learn it"))
+      .. (option.skill and option.skill.min > 1 and (" (" .. option.skill.min .. ")") or "") .. " - "
+  end
+  return "Recipe not learned - "
+end
+
+-- Fills an option card's title and detail. Returns whether it is the best
+-- way (a learned craft that is not a gathering material or a loop).
+local function fillCard(card, option, node)
+  if option.kind == Routes.CRAFT then
+    local reagents = {}
+    for _, reagent in ipairs(option.recipe.reagents or {}) do
+      reagents[#reagents + 1] = string.format("%d %s", reagent.quantity, nameOf(reagent.itemID))
+    end
+    card.title:SetText(option.combine and ("Combine " .. (option.name or "the items")) or string.format("Craft with %s", option.professionName or "a profession"))
+    card.detail:SetText(craftState(option, node) .. (option.cycle and "loops back to this item - " or "") .. table.concat(reagents, ", ") .. " per craft")
+    return option.learned and not option.cycle and not node.raw
+  elseif option.kind == Routes.BUY then
+    local price = ns.PriceProvider.GetMarket(node.itemID)
+    card.title:SetText("Buy on the Auction House")
+    card.detail:SetText(price and ("Auction House - " .. ns.PriceProvider.Freshness(price).label) or "No Auction House price recorded")
+  elseif option.reagent then
+    local child = option.reagent
+    if child.step then
+      card.title:SetText("Train " .. (child.step.name or "the recipe"))
+    elseif child.forSkill then
+      card.title:SetText(string.format("%d x %s", child.craft and child.craft.crafts or 0, labelOf(child)))
+    else
+      card.title:SetText(string.format("%d x %s", child.quantity, labelOf(child)))
+    end
+    card.detail:SetText(child.forSkill and noteText(child) or viaText(child))
+  else
+    card.title:SetText(option.label or R.RouteLabels[option.kind] or "Obtain")
+    card.detail:SetText(option.detail or "")
+  end
+  return false
+end
+
+local function createSide(view, tree)
+  local side = Widgets.Panel(view, "Selected node", { pad = 0 })
+  side:SetWidth(SIDE)
+  local body = side.body
+  local icon = Widgets.ItemIcon(body, 32)
+  icon:SetPoint("TOPLEFT", body, "TOPLEFT", 12, -10)
+  local name = Widgets.Text(body, "goalName", "")
+  name:SetPoint("TOPLEFT", icon, "TOPRIGHT", 10, -2)
+  name:SetPoint("RIGHT", body, "RIGHT", -12, 0)
+  local sub = Widgets.Text(body, "small", "")
+  sub:SetPoint("TOPLEFT", name, "BOTTOMLEFT", 0, -3)
+  sub:SetPoint("RIGHT", body, "RIGHT", -12, 0)
+  local count = Widgets.Text(body, "bigNumber", "")
+  count:SetPoint("TOPLEFT", icon, "BOTTOMLEFT", 0, -8)
+  local missing = Widgets.Text(body, "small", "", { color = C.missing, justify = "RIGHT" })
+  missing:SetPoint("BOTTOM", count, "BOTTOM", 0, 2)
+  missing:SetPoint("RIGHT", body, "RIGHT", -12, 0)
+  local bar = Widgets.ProgressBar(body, 6, "gold")
+  bar:SetPoint("TOPLEFT", count, "BOTTOMLEFT", 0, -5)
+  bar:SetPoint("RIGHT", body, "RIGHT", -12, 0)
+  local waysLabel = Widgets.Text(body, "label", "Ways to get more", { caps = true })
+  waysLabel:SetPoint("TOPLEFT", bar, "BOTTOMLEFT", 0, -10)
+  side.cards = {}
+  for i = 1, MAX_OPTIONS do
+    local card = createOptionCard(body, i, tree)
+    if i == 1 then
+      card:SetPoint("TOPLEFT", waysLabel, "BOTTOMLEFT", 0, -5)
+    else
+      card:SetPoint("TOPLEFT", side.cards[i - 1], "BOTTOMLEFT", 0, -4)
+    end
+    card:SetPoint("RIGHT", body, "RIGHT", -12, 0)
+    card:Hide()
+    side.cards[i] = card
+  end
+  local alsoUsed = Widgets.Text(body, "small", "", { wrap = true })
+  alsoUsed:SetPoint("TOPLEFT", side.cards[MAX_OPTIONS], "BOTTOMLEFT", 0, -8)
+  alsoUsed:SetPoint("RIGHT", body, "RIGHT", -12, 0)
+  local use = Widgets.Button(body, "Use crafting route", { primary = true, onClick = function()
+    if side.node and side.alternative then tree:ApplyRoute(side.node, side.alternative) end
+  end })
+  use:SetPoint("BOTTOMLEFT", body, "BOTTOMLEFT", 12, 10)
+  local link = Widgets.Button(body, "Link", { onClick = function()
+    if side.node and side.node.itemID then CraftingTree.LinkItem(side.node.itemID) end
+  end })
+  link:SetPoint("BOTTOMRIGHT", body, "BOTTOMRIGHT", -12, 10)
+  local reset = Widgets.Button(body, "Default route", { onClick = function()
+    if side.node and side.node.itemID and tree.goal then
+      ns.UI.MainFrame.ReportFailure(ns.GoalService.SetRoute(tree.goal.id, side.node.itemID, nil))
+      ns.UI.MainFrame.SetAlert("Route reset to default.", "info")
+    end
+  end })
+  reset:SetPoint("RIGHT", link, "LEFT", -6, 0)
+  reset:Hide()
+  local empty = Widgets.EmptyState(body, "No component selected", "Click a row in the tree to see how to get it.")
+  empty:SetPoint("TOPLEFT", body, "TOPLEFT", 0, -40)
+  empty:SetPoint("TOPRIGHT", body, "TOPRIGHT", 0, -40)
+  empty:SetHeight(80)
+  side.icon, side.name, side.sub, side.count, side.missing, side.bar, side.waysLabel, side.alsoUsed, side.use, side.link, side.reset, side.empty =
+    icon, name, sub, count, missing, bar, waysLabel, alsoUsed, use, link, reset, empty
+  side.content = { icon, name, sub, count, missing, bar, waysLabel, alsoUsed, use, link }
+
+  function side:Render(node, goalID)
+    self.node = node
+    if not node then
+      for _, w in ipairs(self.content) do w:Hide() end
+      for _, card in ipairs(self.cards) do card:Hide() end
+      reset:Hide()
+      empty:Show()
+      self:SetTitle("Selected node")
+      return
+    end
+    empty:Hide()
+    for _, w in ipairs(self.content) do w:Show() end
+    local item = displayOf(node)
+    self:SetTitle(isSkillRoot(node) and "Skill plan" or (node.depth == 0 and "Goal item" or (node.step and "Step" or (node.forSkill and "Craft for skill" or "Selected node"))))
+    icon:SetItem(item.icon, item.quality)
+    name:SetText(Theme.QualityText(item.name or ("Item " .. tostring(node.itemID)), item.quality))
+    local h = nodeHeader(node)
+    sub:SetText(h.sub)
+    count:SetText(h.count)
+    missing:SetText(h.missing)
+    if h.missingColor then Widgets.SetTextColor(missing, h.missingColor) end
+    bar:SetKind(h.barKind)
+    bar:SetValue(h.barValue)
+    waysLabel:SetText(Theme.Upper(h.ways))
+
+    -- Option cards: craft (best when learned), buy, static hints.
+    local options = {}
+    if not isCraftOnly(node) and not isSkillRoot(node) then
+      for _, option in ipairs(node.options or {}) do
+        if #options < MAX_OPTIONS then options[#options + 1] = option end
+      end
+    else
+      for _, child in ipairs(node.children) do
+        if #options < MAX_OPTIONS then options[#options + 1] = { reagent = child } end
+      end
+    end
+    self.alternative = nil
+    for i, card in ipairs(self.cards) do
+      local option = options[i]
+      if option then
+        card.option, card.node = option, node
+        local isCurrent = option.kind == node.route
+        local best = fillCard(card, option, node)
+        local optionPrice = (option.kind == Routes.BUY or option.kind == Routes.VENDOR) and ns.PriceProvider.GetPrice(node.itemID) or nil
+        local costText
+        if optionPrice and node.missing > 0 then
+          costText = Widgets.Money(optionPrice.copper * node.missing, true) .. (isCurrent and Theme.ColorText("gold", " - current") or "")
+        else
+          costText = isCurrent and Theme.ColorText("gold", "current") or Theme.ColorText("text3", option.unavailable and "no gatherer" or "no price")
+        end
+        card.cost:SetText(costText)
+        card:Fit()
+        if best then
+          Widgets.SetBackdrop(card, C.cardBest, C.gold)
+          card.best:Show()
+        else
+          Widgets.SetBackdrop(card, C.sidebar, isCurrent and C.bronzeDim or C.line)
+          card.best:Hide()
+        end
+        if not isCurrent and not self.alternative and ns.GoalModel.IsRouteOverride(option.kind) and not option.cycle then
+          self.alternative = option
+        end
+        card:Show()
+      else
+        card:Hide()
+      end
+    end
+
+    -- Also used by other goals.
+    local trees = {}
+    for id, v in pairs(ns.GoalService.Views()) do trees[id] = v.tree end
+    local uses = R.UsesOf(trees, node.itemID, goalID)
+    if #uses > 0 then
+      local parts = {}
+      for _, use in ipairs(uses) do
+        local goal = ns.GoalService.Get(use.goalID)
+        parts[#parts + 1] = string.format("%s x%d", goal and ns.GoalService.Name(goal) or use.goalID, use.quantity)
+      end
+      alsoUsed:SetText(Theme.ColorText("text2", "Also used by: ") .. table.concat(parts, ", "))
+    else
+      alsoUsed:SetText(node.depth == 0 and "" or Theme.ColorText("text3", "Not used by other goals"))
+    end
+
+    if isCraftOnly(node) or node.step or not self.alternative then
+      use:Hide()
+    else
+      use:Show()
+      use:SetLabel(self.alternative.kind == Routes.CRAFT and "Use crafting route" or "Use buying route")
+    end
+    if not isCraftOnly(node) and node.routeSource == "override" then reset:Show() else reset:Hide() end
+    link:SetEnabledState(item.link ~= nil)
+  end
+  return side
+end
+
+---------------------------------------------------------------------------
+-- The tab
+---------------------------------------------------------------------------
+function CraftingTree.Create(screen)
+  local view = CreateFrame("Frame", nil, screen)
+  view.collapsed = {}
+  view.filter = "all"
+
+  local toolbar = CreateFrame("Frame", nil, view)
+  toolbar:SetHeight(28)
+  toolbar:SetPoint("TOPLEFT", view, "TOPLEFT", 0, 0)
+  toolbar:SetPoint("TOPRIGHT", view, "TOPRIGHT", 0, 0)
+  local expand = Widgets.Button(toolbar, "Expand all", { onClick = function()
+    view.collapsed = {}
+    view:Render(view.view)
+  end })
+  expand:SetPoint("LEFT", toolbar, "LEFT", 0, 0)
+  local collapse = Widgets.Button(toolbar, "Collapse all", { onClick = function()
+    view.collapsed = {}
+    if view.tree then
+      for key, node in pairs(view.tree.byKey) do
+        if node.depth > 0 and #node.children > 0 then view.collapsed[key] = true end
+      end
+    end
+    view:Render(view.view)
+  end })
+  collapse:SetPoint("LEFT", expand, "RIGHT", 6, 0)
+  local showLabel = Widgets.Text(toolbar, "label", "Show", { caps = true })
+  showLabel:SetPoint("LEFT", collapse, "RIGHT", 18, 0)
+  local filter = Widgets.Segment(toolbar, { { key = "all", label = "All" }, { key = "unresolved", label = "Unresolved only" } }, function(key)
+    view.filter = key
+    view:Render(view.view)
+  end)
+  filter:SetPoint("LEFT", showLabel, "RIGHT", 8, 0)
+  view.expand, view.collapse, view.filterSegment = expand, collapse, filter
+
+  local legend = { { "ok", "Have" }, { "partial", "Partial" }, { "missing", "Missing" }, { "gold", "Craftable" }, { "info", "AH" } }
+  local previous
+  for i = #legend, 1, -1 do
+    local text = Widgets.Text(toolbar, "small", legend[i][2])
+    local dot = Widgets.Dot(toolbar, legend[i][1])
+    if previous then
+      text:SetPoint("RIGHT", previous, "LEFT", -12, 0)
+    else
+      text:SetPoint("RIGHT", toolbar, "RIGHT", -2, 0)
+    end
+    dot:SetPoint("RIGHT", text, "LEFT", -4, 0)
+    previous = dot
+  end
+
+  local side = createSide(view, view)
+  side:SetPoint("TOPRIGHT", toolbar, "BOTTOMRIGHT", 0, -8)
+  side:SetPoint("BOTTOMRIGHT", view, "BOTTOMRIGHT", 0, 0)
+  view.side = side
+
+  local main = Widgets.Panel(view, nil, { pad = 0 })
+  main:SetPoint("TOPLEFT", toolbar, "BOTTOMLEFT", 0, -8)
+  main:SetPoint("BOTTOMRIGHT", side, "BOTTOMLEFT", -10, 0)
+  local body = main.body
+  local header = Widgets.TableHeader(body, {
+    { "Est. cost", COLS.cost, "RIGHT" }, { "Get via", COLS.via }, { "Status", COLS.status }, { "Have", COLS.have, "RIGHT" },
+  }, { "Component", 12 })
+
+  local footer = Widgets.TableFooter(body, 40)
+  local resolvedText = Widgets.Text(footer, "secondaryBright", "")
+  resolvedText:SetPoint("LEFT", footer, "LEFT", 12, 0)
+  local costText = Widgets.Text(footer, "secondary", "Unresolved cost: no price data", { color = C.text3, justify = "RIGHT" })
+  costText:SetPoint("RIGHT", footer, "RIGHT", -12, 0)
+  local bar = Widgets.ProgressBar(footer, 6, "gold")
+  bar:SetPoint("LEFT", resolvedText, "RIGHT", 12, 0)
+  bar:SetPoint("RIGHT", costText, "LEFT", -12, 0)
+  view.resolvedText, view.costText, view.bar = resolvedText, costText, bar
+
+  local scroll = Widgets.TableScroll(body, header, footer)
+  view.scroll = scroll
+  view.pool = Widgets.Pool(scroll.content, function(content, index) return createRow(content, index, view) end)
+  view.message = Widgets.EmptyState(body, "", "")
+  view.message:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -40)
+  view.message:SetPoint("TOPRIGHT", header, "BOTTOMRIGHT", 0, -40)
+  view.message:SetHeight(120)
+  view.message:Hide()
+
+  function view:ToggleNode(key)
+    if self.collapsed[key] then self.collapsed[key] = nil else self.collapsed[key] = true end
+    self:Render(self.view)
+  end
+
+  function view:SelectNode(key)
+    self.selectedKey = key
+    self:Render(self.view)
+  end
+
+  function view:ApplyRoute(node, option)
+    if not self.goal or not node or isCraftOnly(node) or node.step then return end
+    if not ns.GoalModel.IsRouteOverride(option.kind) then
+      ns.UI.MainFrame.SetAlert("That source is informational; routes can only be craft or buy.", "info")
+      return
+    end
+    local ok, err = ns.GoalService.SetRoute(self.goal.id, node.itemID, option.kind)
+    if ok then
+      ns.UI.MainFrame.SetAlert(string.format("%s: %s route selected.", nameOf(node.itemID), option.kind == Routes.CRAFT and "crafting" or "buying"), "ok")
+    else
+      ns.UI.MainFrame.SetAlert(tostring(err), "error")
+    end
+  end
+
+  -- Renders a Planner view (uses view.tree). Nil or a view without a tree
+  -- shows the status message instead.
+  function view:Render(planView)
+    self.view = planView
+    self.goal = planView and planView.goal
+    local tree = planView and planView.tree
+    self.tree = tree
+    self.byKey = tree and tree.byKey
+    if not tree then
+      self.pool:HideFrom(1)
+      self.scroll:SetContentHeight(1)
+      self.message:Set(planView and (ns.Readiness.Label(planView.readiness) or "Unavailable") or "No goal", planView and planView.message or "")
+      self.message:Show()
+      self.resolvedText:SetText("")
+      self.bar:SetValue(0)
+      self.side:Render(nil)
+      return
+    end
+    self.message:Hide()
+    if not self.selectedKey or not tree.byKey[self.selectedKey] then
+      -- Default to the first unresolved reagent, else the root.
+      self.selectedKey = tree.root.key
+      for _, child in ipairs(tree.root.children) do
+        if child.missing > 0 then self.selectedKey = child.key break end
+      end
+    end
+    local rows = R.Flatten(tree, { collapsed = self.collapsed, unresolvedOnly = self.filter == "unresolved" })
+    local goalPercent = ns.Overview.Percent(planView)
+    for index, entry in ipairs(rows) do
+      local row = self.pool:Get(index)
+      local node = entry.node
+      row.node = node
+      row:Layout(entry)
+      local item = displayOf(node)
+      row.icon:SetItem(item.icon, item.quality)
+      row.name:SetText(Theme.QualityText(item.name or ("Item " .. tostring(node.itemID)), item.quality) .. (node.step and "" or Theme.ColorText("text2", "  x" .. node.quantity)))
+      row.note:SetText(noteText(node))
+      if isSkillRoot(node) then
+        row.have:SetText(Theme.ColorText("text3", "-"))
+        row.badge:SetBadge((goalPercent or 0) .. "%", "gold")
+        row.cost:SetText(Theme.ColorText("text3", "-"))
+      elseif node.step then
+        row.have:SetText(Theme.ColorText("text3", "-"))
+        row.badge:SetBadge("Train", "gold")
+        local cost = node.step.trainer and node.step.trainer.cost
+        row.cost:SetText(cost and cost > 0 and Widgets.Money(cost, true) or Theme.ColorText("text3", "?"))
+      elseif node.forSkill then
+        row.have:SetText(Theme.ColorText("text3", "-"))
+        row.badge:SetBadge(node.childrenResolved and "Ready" or "Craft", node.childrenResolved and "ok" or "gold")
+        row.cost:SetText(Theme.ColorText("text3", "-"))
+      elseif isCraftRoot(node) then
+        row.have:SetText(Theme.ColorText("text3", "-"))
+        row.badge:SetBadge((goalPercent or 0) .. "%", "gold")
+        row.cost:SetText(Theme.ColorText("text3", "?"))
+      else
+        row.have:SetText(string.format("%s%d|r%s/%d", Theme.Hex[node.coverage == "have" and "ok" or (node.coverage == "partial" and "partial" or "missing")], node.available or 0, Theme.Hex.text3, node.quantity))
+        local badge = COVERAGE_BADGE[node.coverage] or COVERAGE_BADGE.missing
+        row.badge:SetBadge(badge[1], badge[2])
+        local price = node.missing > 0 and node.route ~= Routes.CRAFT and ns.PriceProvider.GetPrice(node.itemID) or nil
+        if price then
+          row.cost:SetText(Widgets.Money(price.copper * node.missing, true))
+        else
+          row.cost:SetText(Theme.ColorText("text3", node.missing > 0 and (node.route == Routes.CRAFT and "-" or "?") or "-"))
+        end
+      end
+      row.via:SetText(viaText(node))
+      Widgets.SetTextColor(row.via, node.route == Routes.CRAFT and node.missing > 0 and C.gold or C.text2)
+      row:SetSelected(node.key == self.selectedKey)
+    end
+    self.pool:HideFrom(#rows + 1)
+    self.scroll:SetContentHeight(#rows * ROW)
+    local summary = tree.summary
+    self.resolvedText:SetText(string.format("%d of %d dependencies resolved", summary.resolved, summary.nodes))
+    self.bar:SetKind(summary.nodes > 0 and summary.resolved == summary.nodes and "ok" or "gold")
+    self.bar:SetValue(summary.nodes > 0 and summary.resolved / summary.nodes or 1)
+    self.side:Render(tree.byKey[self.selectedKey], self.goal and self.goal.id)
+  end
+
+  return view
+end
+
+-- Inserts an item link into the open chat box or search (MainFrame.LinkItem).
+function CraftingTree.LinkItem(itemID)
+  return ns.UI.MainFrame.LinkItem(itemID)
+end

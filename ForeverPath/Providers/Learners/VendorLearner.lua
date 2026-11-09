@@ -1,0 +1,195 @@
+-- Vendor recorder. Every time a merchant window opens, the items it sells are
+-- written into the account database with the NPC, zone and unit price. This
+-- is the only vendor data that is guaranteed to match this build of Forever,
+-- and it also registers as a price source: vendor prices are exact.
+local _, ns = ...
+
+local Compat = ns.Compat
+local Util = ns.Util
+local Log = ns.Log
+local Events = ns.Events
+local Routes = ns.DependencyResolver.Routes
+
+local VendorLearner = { open = false }
+ns.VendorLearner = VendorLearner
+
+function VendorLearner.IsAvailable()
+  return Compat.GetMerchantNumItems ~= nil and Compat.GetMerchantItemLink ~= nil and Compat.GetMerchantItem ~= nil
+end
+
+function VendorLearner.Store()
+  if not ns.Database.IsLoaded() then return nil end
+  return ns.db.vendors
+end
+
+local function itemIDFromLink(link)
+  if type(link) ~= "string" then return nil end
+  local id = link:match("|Hitem:(%d+)")
+  return id and tonumber(id) or nil
+end
+
+local function currentNPC()
+  local name = ns.Compat.Readable(Util.SafeCall(UnitName, "npc"))
+  if type(name) ~= "string" or name == "" then return nil end
+  return name
+end
+
+local function currentZone()
+  local zone, sub = Util.SafeCall(GetZoneText), nil
+  local s = Util.SafeCall(GetSubZoneText)
+  if s and s ~= "" then sub = s end
+  return zone, sub
+end
+
+-- Records the open merchant. Returns the number of items recorded.
+function VendorLearner.ScanMerchant()
+  local store = VendorLearner.Store()
+  if not store or not VendorLearner.IsAvailable() or not VendorLearner.open then
+    return 0
+  end
+  local npc = currentNPC()
+  if not npc then
+    return 0
+  end
+  local count = Util.SafeCall(Compat.GetMerchantNumItems)
+  if type(count) ~= "number" then
+    return 0
+  end
+  local zone, subzone = currentZone()
+  local now = Util.Now()
+  local recorded = 0
+  for index = 1, count do
+    local itemID = itemIDFromLink(Util.SafeCall(Compat.GetMerchantItemLink, index))
+    local info = Util.SafeCall(Compat.GetMerchantItem, index)
+    if itemID and type(info) == "table" then
+      local stack = (tonumber(info.stack) and info.stack > 0) and info.stack or 1
+      local entry = {
+        price = (not info.hasExtendedCost and tonumber(info.price) and info.price > 0) and math.floor(info.price / stack) or nil,
+        stack = stack,
+        limited = (tonumber(info.numAvailable) or -1) >= 0,
+        extended = info.hasExtendedCost and true or nil,
+        zone = zone,
+        subzone = subzone,
+        seenAt = now,
+      }
+      store[itemID] = store[itemID] or {}
+      store[itemID][npc] = entry
+      if info.name then ns.ItemProvider.RememberName(itemID, info.name) end
+      recorded = recorded + 1
+    end
+  end
+  Log.Debug("Recorded vendor %s (%s): %d items", npc, zone or "?", recorded)
+  if recorded > 0 then
+    Events.Fire("FP_SOURCES_UPDATED", "vendor", npc)
+  end
+  return recorded
+end
+
+-- Vendors known to sell itemID: { { name, price (copper per unit or nil), stack, zone, subzone, seenAt, limited, extended } }
+-- sorted by price, cheapest first.
+function VendorLearner.VendorsFor(itemID)
+  local store = VendorLearner.Store()
+  local out = {}
+  local seen = {}
+  local function add(byNPC, shared)
+    if type(byNPC) ~= "table" then return end
+    for npc, entry in pairs(byNPC) do
+      if type(npc) == "string" and type(entry) == "table" and not seen[npc] then
+        seen[npc] = true
+        out[#out + 1] = { name = npc, price = tonumber(entry.price), stack = entry.stack, zone = entry.zone, subzone = entry.subzone,
+          seenAt = entry.seenAt, limited = entry.limited, extended = entry.extended, shared = shared or nil }
+      end
+    end
+  end
+  add(store and store[itemID], false)
+  -- Merchants other players recorded and shared (App/Share.lua) fill in the ones not visited here.
+  ns.Database.EachImported("vendors", function(_, vendors) add(vendors[itemID], true) end)
+  table.sort(out, function(a, b)
+    local pa, pb = a.price or math.huge, b.price or math.huge
+    if pa ~= pb then return pa < pb end
+    return a.name < b.name
+  end)
+  return out
+end
+
+-- Resolver hints.
+function VendorLearner.ItemHints(itemID)
+  local options = {}
+  for _, vendor in ipairs(VendorLearner.VendorsFor(itemID)) do
+    local where = vendor.zone or "?"
+    if vendor.subzone then where = where .. " (" .. vendor.subzone .. ")" end
+    local cost
+    if vendor.price then
+      cost = Util.Money(vendor.price)
+    elseif vendor.extended then
+      cost = "costs other items"
+    else
+      cost = "price unknown"
+    end
+    options[#options + 1] = {
+      kind = Routes.VENDOR, name = vendor.name, price = vendor.price, zone = vendor.zone,
+      label = "Buy from " .. vendor.name,
+      detail = string.format("%s - %s each%s", where, cost, vendor.limited and " (limited stock)" or ""),
+    }
+  end
+  return options
+end
+
+-- Cheapest known vendor price for the PriceProvider boundary.
+function VendorLearner.GetPrice(itemID)
+  local vendors = VendorLearner.VendorsFor(itemID)
+  local best = vendors[1]
+  if best and best.price then
+    return { copper = best.price, source = "vendor", scannedAt = best.seenAt, kind = "vendor", vendor = best.name }
+  end
+  -- Nothing recorded on this client: the classic vendor price, if any vendor
+  -- this faction can use sells it (a merchant window visit replaces it).
+  local CDB = ns.ClassicDBBridge
+  if CDB.IsAvailable() then
+    local price, vendor = CDB.VendorPrice(itemID)
+    if price then
+      return { copper = price, source = "vendor", kind = "vendor", vendor = vendor.npc.name, classic = true }
+    end
+  end
+  return nil, "no vendor recorded"
+end
+
+function VendorLearner.Count()
+  local store = VendorLearner.Store()
+  local items, vendors, seen = 0, 0, {}
+  for _, byNPC in pairs(store or {}) do
+    items = items + 1
+    for npc in pairs(byNPC) do
+      if not seen[npc] then seen[npc] = true; vendors = vendors + 1 end
+    end
+  end
+  return items, vendors
+end
+
+function VendorLearner.StatusLine()
+  local items, vendors = VendorLearner.Count()
+  return string.format("Vendors: %d item%s from %d vendor%s recorded (whenever you open a merchant).",
+    items, items == 1 and "" or "s", vendors, vendors == 1 and "" or "s")
+end
+
+function VendorLearner.Init()
+  ns.PriceProvider.RegisterSource("vendor", { IsAvailable = function() return true end, GetPrice = VendorLearner.GetPrice })
+  if not VendorLearner.IsAvailable() then
+    Log.Debug("Merchant API unavailable; vendor recording disabled")
+    return
+  end
+  Events.RegisterWoW("MERCHANT_SHOW", function()
+    VendorLearner.open = true
+    VendorLearner.ScanMerchant()
+    -- Item data for merchant slots can arrive a moment after the frame opens.
+    Compat.After(0.5, function() Log.Call(VendorLearner.ScanMerchant) end)
+  end)
+  Events.RegisterWoW("MERCHANT_UPDATE", function()
+    if VendorLearner.open then
+      Events.Debounce("merchant-scan", 0.3, VendorLearner.ScanMerchant)
+    end
+  end)
+  Events.RegisterWoW("MERCHANT_CLOSED", function()
+    VendorLearner.open = false
+  end)
+end
